@@ -1,5 +1,5 @@
 import { McpUseProvider, useCallTool, useWidget, type WidgetMetadata } from "mcp-use/react";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { z } from "zod";
 import "./styles.css";
 
@@ -76,8 +76,6 @@ type SentimentStats = {
   positive: number;
   neutral: number;
   negative: number;
-  averageScore: number;
-  spread: number;
 };
 
 type DemographicRow = {
@@ -215,32 +213,6 @@ function formatValue(value: unknown): string {
   return "N/A";
 }
 
-function formatMetricName(metric: string): string {
-  return metric
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function normalizeDimensionInput(value: string): string[] {
-  const seen = new Set<string>();
-  const dimensions: string[] = [];
-
-  value
-    .split(/[\n,]/g)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-    .forEach((entry) => {
-      const key = entry.toLowerCase();
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
-      dimensions.push(entry);
-    });
-
-  return dimensions.slice(0, 8);
-}
-
 function formatDemographicSegment(segment: string): string {
   return segment
     .replace(/_/g, " ")
@@ -344,8 +316,6 @@ function normalizeSentimentStats(breakdown: Record<string, unknown>): SentimentS
     positive: Math.max(0, toNumber(breakdown.positive, 0)),
     neutral: Math.max(0, toNumber(breakdown.neutral, 0)),
     negative: Math.max(0, toNumber(breakdown.negative, 0)),
-    averageScore: toNumber(breakdown.average_score, 0),
-    spread: toNumber(breakdown.score_spread, 0),
   };
 }
 
@@ -441,7 +411,7 @@ const FocusGroupResults: React.FC = () => {
   const [editableTargetAudience, setEditableTargetAudience] = useState("");
   const [editableStimulus, setEditableStimulus] = useState("");
   const [editableImageUrl, setEditableImageUrl] = useState("");
-  const [editableDimensions, setEditableDimensions] = useState("");
+  const lastHydratedRunSignature = useRef<string | null>(null);
 
   const [latestFollowups, setLatestFollowups] = useState<FollowupBatchItem[]>([]);
 
@@ -452,28 +422,34 @@ const FocusGroupResults: React.FC = () => {
   }, [currentRunProps, isPending, props]);
 
   const displayProps = currentRunProps ?? props;
-
-  useEffect(() => {
-    setEditableTargetAudience(displayProps.target_audience ?? "");
-    setEditableStimulus(displayProps.stimulus_description ?? "");
-    setEditableImageUrl(displayProps.image_url ?? "");
-    const dimensions =
-      displayProps.analysis_dimensions ??
-      displayProps.manager_summary?.analysis_dimensions ??
-      [];
-    setEditableDimensions(
-      dimensions
-        .map((dimension) => dimension.label || dimension.key)
-        .filter((label) => label?.trim().length > 0)
-        .join(", ")
-    );
+  const runHydrationSignature = useMemo(() => {
+    const runId =
+      isRecord(displayProps.raw) && asString(displayProps.raw.run_id)
+        ? asString(displayProps.raw.run_id)
+        : "";
+    return [
+      runId ?? "",
+      displayProps.target_audience ?? "",
+      displayProps.stimulus_description ?? "",
+      displayProps.image_url ?? "",
+    ].join("::");
   }, [
-    displayProps.analysis_dimensions,
     displayProps.image_url,
-    displayProps.manager_summary?.analysis_dimensions,
+    displayProps.raw,
     displayProps.stimulus_description,
     displayProps.target_audience,
   ]);
+
+  useEffect(() => {
+    if (lastHydratedRunSignature.current === runHydrationSignature) {
+      return;
+    }
+
+    setEditableTargetAudience(displayProps.target_audience ?? "");
+    setEditableStimulus(displayProps.stimulus_description ?? "");
+    setEditableImageUrl(displayProps.image_url ?? "");
+    lastHydratedRunSignature.current = runHydrationSignature;
+  }, [displayProps, runHydrationSignature]);
 
   const personas = useMemo(() => {
     return Array.isArray(displayProps.personas) ? displayProps.personas : [];
@@ -547,27 +523,6 @@ const FocusGroupResults: React.FC = () => {
     });
   }, [activePersona, personas, segmentKey, segmentValue, targetMode]);
 
-  const analysisDimensions =
-    displayProps.analysis_dimensions ??
-    displayProps.manager_summary?.analysis_dimensions ??
-    [];
-
-  const dimensionLabelByKey = useMemo(() => {
-    const mapping = new Map<string, string>();
-    analysisDimensions.forEach((dimension) => {
-      mapping.set(dimension.key, dimension.label || formatMetricName(dimension.key));
-    });
-    return mapping;
-  }, [analysisDimensions]);
-
-  const cognitiveMetrics = Object.entries(
-    displayProps.manager_summary?.cognitive_load_heatmap ?? {}
-  ).map(([metric, value]) => ({
-    metric,
-    label: dimensionLabelByKey.get(metric) ?? formatMetricName(metric),
-    value: clampPercent(toNumber(value, 0)),
-  }));
-
   const sentimentStats = normalizeSentimentStats(
     displayProps.manager_summary?.sentiment?.breakdown ?? {}
   );
@@ -628,11 +583,6 @@ const FocusGroupResults: React.FC = () => {
         payload.image_url = imageUrl;
       }
 
-      const dimensions = normalizeDimensionInput(editableDimensions);
-      if (dimensions.length > 0) {
-        payload.analysis_dimensions = dimensions;
-      }
-
       try {
         const result = await runSyntheticFocusGroup(payload);
         const structured = result.structuredContent;
@@ -658,7 +608,6 @@ const FocusGroupResults: React.FC = () => {
       }
     },
     [
-      editableDimensions,
       editableImageUrl,
       editableStimulus,
       editableTargetAudience,
@@ -900,21 +849,6 @@ const FocusGroupResults: React.FC = () => {
               />
             </div>
 
-            <div className="space-y-1">
-              <label className="text-xs uppercase tracking-wide text-secondary">
-                Analysis Dimensions (Optional)
-              </label>
-              <textarea
-                value={editableDimensions}
-                onChange={(event) => setEditableDimensions(event.target.value)}
-                className="w-full rounded-lg border border-default bg-surface px-3 py-2 text-sm text-default outline-none focus:ring-2 focus:ring-info/40 min-h-16"
-                placeholder="Comma-separated, e.g. Brand Trust, Value Clarity, Actionability"
-              />
-              <p className="text-[11px] text-secondary">
-                Leave blank to auto-generate dimension set from the stimulus.
-              </p>
-            </div>
-
             <div className="flex items-center gap-2">
               <button
                 type="submit"
@@ -924,7 +858,7 @@ const FocusGroupResults: React.FC = () => {
                 {isRerunPending ? "Rerunning..." : "Rerun Focus Group"}
               </button>
               <p className="text-xs text-secondary">
-                Edit audience, stimulus, image, and dimensions, then rerun in place.
+                Edit audience, stimulus, and image, then rerun in place.
               </p>
             </div>
 
@@ -937,55 +871,10 @@ const FocusGroupResults: React.FC = () => {
         </section>
 
         <section className="relative space-y-3">
-          <h3 className="text-lg font-semibold text-default">Aggregation View</h3>
-          {analysisDimensions.length > 0 && (
-            <div className="rounded-2xl border border-default bg-white/70 px-3 py-2 shadow-sm">
-              <p className="text-[11px] uppercase tracking-[0.14em] text-secondary mb-2">
-                Active Dimensions
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {analysisDimensions.map((dimension) => (
-                  <span
-                    key={dimension.key}
-                    className="text-[11px] rounded-full border border-default bg-surface px-2 py-1 text-secondary"
-                    title={dimension.description || undefined}
-                  >
-                    {dimension.label}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-          <div className="grid grid-cols-1 xl:grid-cols-[1.1fr_1fr] gap-3">
-            <div className="rounded-2xl border border-default bg-white/70 p-4 shadow-sm space-y-3">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-secondary">
-                Cognitive Load Heatmap
-              </p>
-
-              {cognitiveMetrics.length === 0 ? (
-                <p className="text-sm text-secondary">No cognitive load data returned.</p>
-              ) : (
-                <div className="space-y-3">
-                  {cognitiveMetrics.map(({ metric, label, value }) => (
-                    <div key={metric} className="space-y-1.5">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-xs text-secondary">{label}</p>
-                        <p className="text-xs font-semibold text-default">{Math.round(value)}</p>
-                      </div>
-                      <div className="h-2 rounded-full bg-default/10 overflow-hidden">
-                        <div
-                          className="h-full rounded-full bg-gradient-to-r from-[#3172b8] via-[#5a8fc9] to-[#eb7a3f] transition-all duration-500"
-                          style={{ width: `${clampPercent(value)}%` }}
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-2xl border border-default bg-white/70 p-4 shadow-sm space-y-3">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-secondary">Sentiment Mix</p>
+          <h3 className="text-base font-semibold text-secondary/80">Background Summary</h3>
+          <div className="opacity-55">
+            <div className="rounded-2xl border border-default/70 bg-white/60 p-4 shadow-sm space-y-3">
+              <p className="text-[10px] uppercase tracking-[0.16em] text-secondary">Sentiment Mix</p>
 
               <div className="rounded-xl border border-default/80 bg-surface p-3 space-y-2">
                 <div className="h-3 rounded-full overflow-hidden bg-default/10 flex">
@@ -1024,58 +913,51 @@ const FocusGroupResults: React.FC = () => {
                   </div>
                 </div>
               </div>
-
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="rounded-lg border border-default/70 bg-surface px-3 py-2">
-                  <p className="text-secondary">Average score</p>
-                  <p className="text-default font-semibold">{sentimentStats.averageScore.toFixed(2)}</p>
-                </div>
-                <div className="rounded-lg border border-default/70 bg-surface px-3 py-2">
-                  <p className="text-secondary">Opinion spread</p>
-                  <p className="text-default font-semibold">{sentimentStats.spread.toFixed(2)}</p>
-                </div>
-              </div>
             </div>
           </div>
 
-          <div className="rounded-2xl border border-default bg-white/70 p-4 shadow-sm space-y-3">
-            <p className="text-[11px] uppercase tracking-[0.16em] text-secondary">Demographics</p>
-            {demographics.length === 0 ? (
-              <p className="text-sm text-secondary">No demographic breakdown returned.</p>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {demographics.map((chart) => {
-                  const maxValue = Math.max(...chart.rows.map((row) => row.value), 1);
+          <details className="rounded-2xl border border-default/70 bg-white/65 p-4 shadow-sm">
+            <summary className="cursor-pointer text-xs uppercase tracking-[0.16em] text-secondary select-none">
+              Demographics
+            </summary>
+            <div className="mt-3">
+              {demographics.length === 0 ? (
+                <p className="text-sm text-secondary">No demographic breakdown returned.</p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {demographics.map((chart) => {
+                    const maxValue = Math.max(...chart.rows.map((row) => row.value), 1);
 
-                  return (
-                    <div
-                      key={chart.segment}
-                      className="rounded-xl border border-default/80 bg-surface p-3 space-y-2"
-                    >
-                      <p className="text-xs font-semibold text-default">
-                        {formatDemographicSegment(chart.segment)}
-                      </p>
+                    return (
+                      <div
+                        key={chart.segment}
+                        className="rounded-xl border border-default/80 bg-surface p-3 space-y-2"
+                      >
+                        <p className="text-xs font-semibold text-default">
+                          {formatDemographicSegment(chart.segment)}
+                        </p>
 
-                      {chart.rows.map((row) => (
-                        <div key={`${chart.segment}-${row.label}`} className="space-y-1">
-                          <div className="flex items-center justify-between text-[11px] text-secondary">
-                            <span>{row.label}</span>
-                            <span>{row.value}</span>
+                        {chart.rows.map((row) => (
+                          <div key={`${chart.segment}-${row.label}`} className="space-y-1">
+                            <div className="flex items-center justify-between text-[11px] text-secondary">
+                              <span>{row.label}</span>
+                              <span>{row.value}</span>
+                            </div>
+                            <div className="h-1.5 rounded-full bg-default/10 overflow-hidden">
+                              <div
+                                className="h-full rounded-full bg-gradient-to-r from-[#7aa7d1] to-[#f1a065]"
+                                style={{ width: `${(row.value / maxValue) * 100}%` }}
+                              />
+                            </div>
                           </div>
-                          <div className="h-1.5 rounded-full bg-default/10 overflow-hidden">
-                            <div
-                              className="h-full rounded-full bg-gradient-to-r from-[#7aa7d1] to-[#f1a065]"
-                              style={{ width: `${(row.value / maxValue) * 100}%` }}
-                            />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </details>
         </section>
 
         <section className="relative space-y-3">

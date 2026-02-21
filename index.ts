@@ -498,12 +498,69 @@ function normalizePersonas(payload: unknown): NormalizedPersona[] {
         ])
       ) ?? `Persona ${index + 1}`;
 
-    return {
-      ...entry,
+    const sanitized: NormalizedPersona = {
       agent_id: agentId,
       name,
     };
+
+    const allowedKeys = [
+      "age_range",
+      "occupation",
+      "persona_type",
+      "gender_identity",
+      "ethnicity",
+      "region",
+      "sentiment_label",
+      "sentiment_score",
+      "stress_level",
+      "quote",
+      "reaction_summary",
+      "tech_comfort",
+      "budget_sensitivity",
+      "stance",
+    ];
+
+    for (const key of allowedKeys) {
+      if (key in entry) {
+        sanitized[key] = entry[key];
+      }
+    }
+
+    const cognitiveLoadCandidate = pickFirst(entry, [
+      "cognitive_load",
+      "cognitiveLoad",
+    ]);
+    if (isRecord(cognitiveLoadCandidate)) {
+      sanitized.cognitive_load = cognitiveLoadCandidate;
+    }
+
+    return sanitized;
   });
+}
+
+function summarizeSimulationRaw(
+  payload: unknown,
+  personaCount: number
+): UnknownRecord {
+  const sources = getPayloadSources(payload);
+
+  const runId = asString(pickFromSources(sources, ["run_id", "runId"])) ?? null;
+  const generationFailures = pickFromSources(sources, [
+    "generation_failures",
+    "generationFailures",
+    "failures",
+  ]);
+
+  const failureList = Array.isArray(generationFailures)
+    ? generationFailures.slice(0, 20)
+    : [];
+
+  return {
+    run_id: runId,
+    persona_count: personaCount,
+    generation_failures: failureList,
+    backend_summary_included: true,
+  };
 }
 
 function normalizeTargetAudienceDetails(
@@ -853,6 +910,7 @@ server.tool(
         target_audience
       );
       const managerSummary = normalizeManagerSummary(simulationResponse);
+      const personas = normalizePersonas(simulationResponse);
 
       const props: FocusGroupWidgetProps = {
         target_audience: audienceDetails.targetAudience,
@@ -863,8 +921,8 @@ server.tool(
         image_url: image_url ?? null,
         analysis_dimensions: managerSummary.analysis_dimensions,
         manager_summary: managerSummary,
-        personas: normalizePersonas(simulationResponse),
-        raw: simulationResponse,
+        personas,
+        raw: summarizeSimulationRaw(simulationResponse, personas.length),
       };
 
       return widget({
