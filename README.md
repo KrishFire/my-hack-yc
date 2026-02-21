@@ -1,4 +1,7 @@
-# MCP Apps Hackathon — Starter
+# MCP Apps Hackathon @ YC by Manufact
+
+![MCP Apps Hackathon](https://d2xtzufx9mvgbo.cloudfront.net/events/Screenshot%202026-02-05%20at%205.39.36%E2%80%AFPM-4352f7d27bd84e6f.png)
+
 
 A hackathon starter built with [mcp-use](https://mcp-use.com) and deployed on [Manufact Cloud](https://manufact.com). Part of the [MCP Apps Hackathon by Manufact](https://events.ycombinator.com/manufact-hackathon26) at Y Combinator.
 
