@@ -12,10 +12,17 @@ type NormalizedSentiment = {
   raw: unknown;
 };
 
+type AnalysisDimension = {
+  key: string;
+  label: string;
+  description?: string;
+};
+
 type NormalizedManagerSummary = {
   cognitive_load_heatmap: Record<string, unknown>;
   sentiment: NormalizedSentiment;
   demographics: UnknownRecord[];
+  analysis_dimensions: AnalysisDimension[];
 };
 
 type NormalizedPersona = UnknownRecord & {
@@ -25,8 +32,11 @@ type NormalizedPersona = UnknownRecord & {
 
 type FocusGroupWidgetProps = {
   target_audience: string;
+  target_audience_generated: boolean;
+  target_audience_generation_notes: string | null;
   stimulus_description: string;
   image_url: string | null;
+  analysis_dimensions: AnalysisDimension[];
   manager_summary: NormalizedManagerSummary;
   personas: NormalizedPersona[];
   raw: unknown;
@@ -110,6 +120,43 @@ function asString(value: unknown): string | undefined {
   }
 
   return undefined;
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "yes" || normalized === "1") {
+      return true;
+    }
+    if (normalized === "false" || normalized === "no" || normalized === "0") {
+      return false;
+    }
+  }
+
+  return undefined;
+}
+
+function toDimensionKey(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || `dimension_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function formatDimensionLabel(value: string): string {
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .trim();
 }
 
 function getPayloadSources(payload: unknown): UnknownRecord[] {
@@ -255,6 +302,59 @@ function normalizeDemographics(value: unknown): UnknownRecord[] {
   return [];
 }
 
+function normalizeAnalysisDimensions(value: unknown): AnalysisDimension[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized: AnalysisDimension[] = [];
+  const seen = new Set<string>();
+
+  value.forEach((entry, index) => {
+    if (typeof entry === "string") {
+      const label = entry.trim();
+      if (!label) {
+        return;
+      }
+
+      const key = toDimensionKey(label);
+      if (seen.has(key)) {
+        return;
+      }
+
+      seen.add(key);
+      normalized.push({
+        key,
+        label,
+      });
+      return;
+    }
+
+    if (!isRecord(entry)) {
+      return;
+    }
+
+    const label =
+      asString(pickFirst(entry, ["label", "name", "dimension", "metric"]))?.trim() ??
+      "";
+    const keyCandidate =
+      asString(pickFirst(entry, ["key", "id", "slug"]))?.trim() ?? "";
+    const key = keyCandidate ? toDimensionKey(keyCandidate) : toDimensionKey(label || `dimension_${index + 1}`);
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    normalized.push({
+      key,
+      label: label || formatDimensionLabel(key),
+      description: asString(pickFirst(entry, ["description", "details", "hint"])),
+    });
+  });
+
+  return normalized;
+}
+
 function normalizeManagerSummary(payload: unknown): NormalizedManagerSummary {
   const sources = getPayloadSources(payload);
 
@@ -277,16 +377,46 @@ function normalizeManagerSummary(payload: unknown): NormalizedManagerSummary {
         ]) as UnknownRecord)
       : null) ?? {};
 
-  return {
-    cognitive_load_heatmap: normalizeHeatmap(
-      pickFirst(managerSummary, [
-        "cognitive_load_heatmap",
-        "cognitiveLoadHeatmap",
-        "cognitive_load",
-        "cognitiveLoad",
-        "heatmap",
+  const cognitiveHeatmap = normalizeHeatmap(
+    pickFirst(managerSummary, [
+      "cognitive_load_heatmap",
+      "cognitiveLoadHeatmap",
+      "cognitive_load",
+      "cognitiveLoad",
+      "heatmap",
+    ])
+  );
+
+  let analysisDimensions = normalizeAnalysisDimensions(
+    pickFirst(managerSummary, [
+      "analysis_dimensions",
+      "analysisDimensions",
+      "dimensions",
+    ])
+  );
+
+  if (analysisDimensions.length === 0) {
+    analysisDimensions = normalizeAnalysisDimensions(
+      pickFromSources(sources, [
+        "analysis_dimensions",
+        "analysisDimensions",
+        "dimensions",
       ])
-    ),
+    );
+  }
+
+  if (analysisDimensions.length === 0) {
+    analysisDimensions = Object.keys(cognitiveHeatmap).map((key) => {
+      const normalizedKey = key.trim() || toDimensionKey(`dimension_${Math.random().toString(36).slice(2, 8)}`);
+      return {
+        key: normalizedKey,
+        label: formatDimensionLabel(normalizedKey),
+      };
+    });
+  }
+
+  return {
+    cognitive_load_heatmap: cognitiveHeatmap,
     sentiment: normalizeSentiment(
       pickFirst(managerSummary, [
         "sentiment",
@@ -303,6 +433,7 @@ function normalizeManagerSummary(payload: unknown): NormalizedManagerSummary {
         "segments",
       ])
     ),
+    analysis_dimensions: analysisDimensions,
   };
 }
 
@@ -373,6 +504,54 @@ function normalizePersonas(payload: unknown): NormalizedPersona[] {
       name,
     };
   });
+}
+
+function normalizeTargetAudienceDetails(
+  payload: unknown,
+  fallbackTargetAudience?: string
+): {
+  targetAudience: string;
+  targetAudienceGenerated: boolean;
+  targetAudienceGenerationNotes: string | null;
+} {
+  const sources = getPayloadSources(payload);
+
+  const targetAudience =
+    asString(
+      pickFromSources(sources, [
+        "target_audience",
+        "targetAudience",
+        "resolved_target_audience",
+        "resolvedTargetAudience",
+      ])
+    ) ??
+    (fallbackTargetAudience?.trim() ? fallbackTargetAudience : "Audience unavailable");
+
+  const targetAudienceGenerated =
+    asBoolean(
+      pickFromSources(sources, [
+        "target_audience_generated",
+        "targetAudienceGenerated",
+        "audience_generated",
+        "audienceGenerated",
+      ])
+    ) ?? false;
+
+  const targetAudienceGenerationNotes =
+    asString(
+      pickFromSources(sources, [
+        "target_audience_generation_notes",
+        "targetAudienceGenerationNotes",
+        "audience_generation_notes",
+        "audienceGenerationNotes",
+      ])
+    ) ?? null;
+
+  return {
+    targetAudience,
+    targetAudienceGenerated,
+    targetAudienceGenerationNotes,
+  };
 }
 
 function normalizeAnswer(value: unknown): string {
@@ -571,16 +750,21 @@ async function postJson(path: string, payload: Record<string, unknown>) {
 }
 
 function makeFallbackSimulationProps(
-  targetAudience: string,
+  targetAudience: string | undefined,
   stimulusDescription: string,
   imageUrl: string | undefined,
+  analysisDimensions: string[] | undefined,
   errorMessage: string,
   raw: unknown
 ): FocusGroupWidgetProps {
+  const normalizedDimensions = normalizeAnalysisDimensions(analysisDimensions ?? []);
   return {
-    target_audience: targetAudience,
+    target_audience: targetAudience?.trim() ? targetAudience : "Audience unavailable",
+    target_audience_generated: false,
+    target_audience_generation_notes: null,
     stimulus_description: stimulusDescription,
     image_url: imageUrl ?? null,
+    analysis_dimensions: normalizedDimensions,
     manager_summary: {
       cognitive_load_heatmap: {},
       sentiment: {
@@ -589,6 +773,7 @@ function makeFallbackSimulationProps(
         raw: null,
       },
       demographics: [],
+      analysis_dimensions: normalizedDimensions,
     },
     personas: [],
     raw,
@@ -604,7 +789,10 @@ server.tool(
     schema: z.object({
       target_audience: z
         .string()
-        .describe("Description of the target audience for the simulation"),
+        .optional()
+        .describe(
+          "Optional target audience. If omitted, the backend auto-generates one from the stimulus."
+        ),
       stimulus_description: z
         .string()
         .describe("Description of the concept, prompt, or stimulus being tested"),
@@ -612,6 +800,12 @@ server.tool(
         .string()
         .optional()
         .describe("Optional image URL used as simulation stimulus"),
+      analysis_dimensions: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Optional custom evaluation dimensions. If omitted, backend auto-generates dimensions from stimulus."
+        ),
     }),
     widget: {
       name: "focus-group-results",
@@ -621,14 +815,31 @@ server.tool(
       resultCanProduceWidget: true,
     },
   },
-  async ({ target_audience, stimulus_description, image_url }) => {
+  async ({
+    target_audience,
+    stimulus_description,
+    image_url,
+    analysis_dimensions,
+  }) => {
     const requestPayload: Record<string, unknown> = {
-      target_audience,
       stimulus_description,
     };
 
+    if (target_audience?.trim()) {
+      requestPayload.target_audience = target_audience;
+    }
+
     if (image_url) {
       requestPayload.image_url = image_url;
+    }
+
+    if (Array.isArray(analysis_dimensions)) {
+      const cleaned = analysis_dimensions
+        .map((dimension) => dimension.trim())
+        .filter((dimension) => dimension.length > 0);
+      if (cleaned.length > 0) {
+        requestPayload.analysis_dimensions = cleaned;
+      }
     }
 
     try {
@@ -637,11 +848,21 @@ server.tool(
         requestPayload
       );
 
+      const audienceDetails = normalizeTargetAudienceDetails(
+        simulationResponse,
+        target_audience
+      );
+      const managerSummary = normalizeManagerSummary(simulationResponse);
+
       const props: FocusGroupWidgetProps = {
-        target_audience,
+        target_audience: audienceDetails.targetAudience,
+        target_audience_generated: audienceDetails.targetAudienceGenerated,
+        target_audience_generation_notes:
+          audienceDetails.targetAudienceGenerationNotes,
         stimulus_description,
         image_url: image_url ?? null,
-        manager_summary: normalizeManagerSummary(simulationResponse),
+        analysis_dimensions: managerSummary.analysis_dimensions,
+        manager_summary: managerSummary,
         personas: normalizePersonas(simulationResponse),
         raw: simulationResponse,
       };
@@ -649,7 +870,7 @@ server.tool(
       return widget({
         props,
         output: text(
-          `Synthetic focus group completed for "${target_audience}" with ${props.personas.length} personas.`
+          `Synthetic focus group completed for "${props.target_audience}" with ${props.personas.length} personas.`
         ),
       });
     } catch (error) {
@@ -662,6 +883,7 @@ server.tool(
           target_audience,
           stimulus_description,
           image_url,
+          analysis_dimensions,
           message,
           raw
         ),
