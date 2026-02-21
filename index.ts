@@ -857,6 +857,13 @@ server.tool(
         .string()
         .optional()
         .describe("Optional image URL used as simulation stimulus"),
+      persona_count: z
+        .number()
+        .int()
+        .min(3)
+        .max(1000)
+        .optional()
+        .describe("Optional number of personas to simulate (3-1000)"),
       analysis_dimensions: z
         .array(z.string())
         .optional()
@@ -876,6 +883,7 @@ server.tool(
     target_audience,
     stimulus_description,
     image_url,
+    persona_count,
     analysis_dimensions,
   }) => {
     const requestPayload: Record<string, unknown> = {
@@ -888,6 +896,10 @@ server.tool(
 
     if (image_url) {
       requestPayload.image_url = image_url;
+    }
+
+    if (typeof persona_count === "number") {
+      requestPayload.persona_count = persona_count;
     }
 
     if (Array.isArray(analysis_dimensions)) {

@@ -22,6 +22,15 @@ except Exception as import_error:  # pragma: no cover
 else:
     _IMPORT_ERROR = None
 
+try:
+    from datasets import get_dataset_split_names, load_dataset
+except Exception as datasets_import_error:  # pragma: no cover
+    load_dataset = None  # type: ignore[assignment]
+    get_dataset_split_names = None  # type: ignore[assignment]
+    _DATASETS_IMPORT_ERROR = datasets_import_error
+else:
+    _DATASETS_IMPORT_ERROR = None
+
 APP_NAME = "synthetic-focus-group-backend"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
@@ -31,12 +40,28 @@ OPENAI_MODEL_FALLBACKS = [
     if model.strip()
 ]
 DEFAULT_PERSONA_COUNT = int(os.getenv("FG_PERSONA_COUNT", "6"))
-MAX_PERSONA_COUNT = int(os.getenv("FG_MAX_PERSONA_COUNT", "12"))
+MAX_PERSONA_COUNT = int(os.getenv("FG_MAX_PERSONA_COUNT", "1000"))
 MAX_PARALLEL_TASKS = int(os.getenv("FG_MAX_PARALLEL_TASKS", "8"))
 TOP_K_MEMORIES = int(os.getenv("FG_TOP_K_MEMORIES", "5"))
-MAX_PERSONA_STORE = int(os.getenv("FG_MAX_PERSONA_STORE", "200"))
-
-SENTIMENT_CYCLE = ("positive", "neutral", "negative")
+MAX_PERSONA_STORE = int(os.getenv("FG_MAX_PERSONA_STORE", "5000"))
+HF_MEMORY_DATASET = os.getenv("FG_HF_MEMORY_DATASET", "yahoo_answers_topics")
+HF_MEMORY_POOL_MIN = int(os.getenv("FG_HF_MEMORY_POOL_MIN", "10"))
+HF_MEMORY_POOL_MAX = int(os.getenv("FG_HF_MEMORY_POOL_MAX", "15"))
+HF_MEMORY_PER_PERSONA_MIN = int(os.getenv("FG_HF_MEMORY_PER_PERSONA_MIN", "2"))
+HF_MEMORY_PER_PERSONA_MAX = int(os.getenv("FG_HF_MEMORY_PER_PERSONA_MAX", "3"))
+HF_MEMORY_CACHE_TTL_SEC = int(os.getenv("FG_HF_MEMORY_CACHE_TTL_SEC", "1800"))
+HF_PERSONA_DATASET = os.getenv("FG_HF_PERSONA_DATASET", "SynthlabsAI/PERSONA")
+HF_PERSONA_DATASET_FALLBACKS = [
+    value.strip()
+    for value in os.getenv(
+        "FG_HF_PERSONA_DATASET_FALLBACKS",
+        "SYNTTHLABSAI/Persona,SYNTHLABSAI/Persona",
+    ).split(",")
+    if value.strip()
+]
+HF_PERSONA_POOL_MIN = int(os.getenv("FG_HF_PERSONA_POOL_MIN", "30"))
+HF_PERSONA_POOL_MAX = int(os.getenv("FG_HF_PERSONA_POOL_MAX", "160"))
+HF_PERSONA_CACHE_TTL_SEC = int(os.getenv("FG_HF_PERSONA_CACHE_TTL_SEC", "1800"))
 
 FALLBACK_FIRST_NAMES = [
     "Maya",
@@ -128,6 +153,38 @@ HEALTH_CLAIM_PATTERN = re.compile(
     r"\b(health(y|ier)?|nutriti(ous|on|onal)|wellness|good for (my|your|our) health|health benefits?)\b",
     re.IGNORECASE,
 )
+OBJECTIVE_UI_HINTS = [
+    "does this image have text",
+    "find the",
+    "button",
+    "click",
+    "tap",
+    "locate",
+    "where is",
+    "checkout",
+    "sign in",
+    "navbar",
+    "menu",
+    "screen",
+    "ui",
+    "ux",
+    "form field",
+    "error message",
+]
+FALLBACK_REAL_WORLD_MEMORIES = [
+    "I bought a product once because the reviews sounded convincing, but it underdelivered in daily use.",
+    "I usually ignore flashy ads and look for practical details, especially return policy and long-term value.",
+    "A checkout flow confused me recently because key actions were hidden below too much content.",
+    "I changed my mind on a service after hearing mixed feedback from friends with different priorities.",
+    "I prefer clear, direct language over hype because I often compare options quickly between errands.",
+    "I once chose a cheaper option, then regretted it when reliability problems showed up within a month.",
+    "I trust products more when I can quickly understand what problem they solve for someone like me.",
+    "I am skeptical of broad claims unless I can find concrete examples or third-party validation.",
+    "I have clicked away from pages that felt cluttered or demanded too much effort to complete one task.",
+    "I am more likely to try something new if the first interaction feels simple and low-risk.",
+    "I value honest tradeoff explanations more than polished branding language.",
+    "I often read both highest and lowest reviews to find recurring patterns before deciding.",
+]
 
 
 class SimulateRequest(BaseModel):
@@ -203,6 +260,10 @@ class PersonaStore:
 app = FastAPI(title=APP_NAME, version="1.1.0")
 store = PersonaStore()
 _client: AsyncOpenAI | None = None
+_real_world_memory_cache: list[str] = []
+_real_world_memory_cache_at: float = 0.0
+_persona_seed_cache: list[dict[str, Any]] = []
+_persona_seed_cache_at: float = 0.0
 
 
 def ensure_openai_client() -> AsyncOpenAI:
@@ -459,11 +520,587 @@ def _lexical_score(question: str, text: str) -> float:
     return overlap / max(1, len(question_tokens))
 
 
-def _sentiment_targets(count: int) -> list[str]:
-    targets: list[str] = []
-    while len(targets) < count:
-        targets.extend(SENTIMENT_CYCLE)
-    return targets[:count]
+def _heuristic_task_type(stimulus_description: str) -> str:
+    normalized = stimulus_description.lower()
+    if any(hint in normalized for hint in OBJECTIVE_UI_HINTS):
+        return "Objective UI Task"
+    return "Subjective Concept"
+
+
+async def _classify_task_type(stimulus_description: str) -> dict[str, str]:
+    heuristic = _heuristic_task_type(stimulus_description)
+    client = ensure_openai_client()
+
+    system_prompt = (
+        "Classify the user request into one of exactly two labels and return strict JSON: "
+        "'Objective UI Task' or 'Subjective Concept'."
+    )
+    user_prompt = f"""
+Stimulus/request:
+{stimulus_description}
+
+Rules:
+- Use "Objective UI Task" for factual UI/UX tasks (locating elements, checking text, validating states).
+- Use "Subjective Concept" for ads, concepts, product opinions, or perception-based critique.
+
+Return JSON:
+- task_type
+- rationale (<= 25 words)
+"""
+
+    try:
+        response = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        content = response.choices[0].message.content or "{}"
+        parsed = _extract_json_object(content)
+
+        task_type = _safe_str(parsed.get("task_type"), heuristic)
+        if task_type not in {"Objective UI Task", "Subjective Concept"}:
+            task_type = heuristic
+
+        return {
+            "task_type": task_type,
+            "task_type_rationale": _safe_str(parsed.get("rationale"), "Classified by primary model"),
+        }
+    except Exception as error:
+        return {
+            "task_type": heuristic,
+            "task_type_rationale": f"Heuristic fallback used: {error}",
+        }
+
+
+def _normalize_memory_seed_text(value: Any, max_chars: int = 320) -> str:
+    text = _safe_str(value, "")
+    if not text:
+        return ""
+    compact = " ".join(text.split())
+    return compact[:max_chars]
+
+
+def _dataset_candidates(primary: str, fallbacks: list[str]) -> list[str]:
+    ordered: list[str] = []
+    for value in [primary, *fallbacks]:
+        cleaned = _clean_optional_str(value)
+        if cleaned and cleaned not in ordered:
+            ordered.append(cleaned)
+    return ordered
+
+
+def _row_first_text(row: dict[str, Any], keys: list[str], max_chars: int = 120) -> str:
+    for key in keys:
+        cleaned = _normalize_memory_seed_text(row.get(key), max_chars=max_chars)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _row_text_list(row: dict[str, Any], keys: list[str], max_items: int = 3) -> list[str]:
+    collected: list[str] = []
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, list):
+            for entry in value:
+                cleaned = _normalize_memory_seed_text(entry, max_chars=220)
+                if cleaned:
+                    collected.append(cleaned)
+                    if len(collected) >= max_items:
+                        return collected
+        else:
+            cleaned = _normalize_memory_seed_text(value, max_chars=220)
+            if cleaned:
+                collected.append(cleaned)
+                if len(collected) >= max_items:
+                    return collected
+    return collected
+
+
+def _normalize_budget_sensitivity(raw: str) -> str:
+    lowered = raw.lower()
+    if any(token in lowered for token in ["high", "very", "strict", "sensitive", "tight"]):
+        return "high"
+    if any(token in lowered for token in ["low", "not sensitive", "flexible", "premium"]):
+        return "low"
+    return "medium"
+
+
+def _normalize_hf_persona_seed_row(row: dict[str, Any]) -> dict[str, Any]:
+    name = _row_first_text(
+        row,
+        ["name", "full_name", "persona_name", "username", "first_name"],
+        max_chars=80,
+    )
+    age_range = _row_first_text(row, ["age_range", "age_bracket", "age"], max_chars=24)
+    occupation = _row_first_text(
+        row,
+        ["occupation", "job_title", "profession", "role", "work"],
+        max_chars=80,
+    )
+    household = _row_first_text(
+        row,
+        ["household", "family_status", "family", "living_situation"],
+        max_chars=120,
+    )
+    region = _row_first_text(row, ["region", "location", "country", "state"], max_chars=80)
+    persona_type = _row_first_text(
+        row,
+        ["persona_type", "archetype", "personality_type", "segment"],
+        max_chars=80,
+    )
+    gender_identity = _row_first_text(
+        row,
+        ["gender_identity", "gender", "sex"],
+        max_chars=32,
+    )
+    ethnicity = _row_first_text(row, ["ethnicity", "race"], max_chars=48)
+    tech_comfort = _row_first_text(
+        row,
+        ["tech_comfort", "technology_adoption", "digital_literacy", "tech_savviness"],
+        max_chars=32,
+    ).lower()
+    daily_context = _row_first_text(
+        row,
+        ["daily_context", "context", "lifestyle", "habits", "routine"],
+        max_chars=180,
+    )
+    budget_raw = _row_first_text(
+        row,
+        ["budget_sensitivity", "price_sensitivity", "budget", "spending_style"],
+        max_chars=48,
+    )
+    budget_sensitivity = _normalize_budget_sensitivity(budget_raw) if budget_raw else ""
+
+    memory_stream = _row_text_list(
+        row,
+        [
+            "past_experiences",
+            "core_opinions",
+            "preferences",
+            "interests",
+            "bio",
+            "background",
+            "description",
+            "profile",
+            "persona",
+            "opinion",
+            "experience",
+        ],
+        max_items=3,
+    )
+
+    seed: dict[str, Any] = {
+        "name": name,
+        "age_range": age_range,
+        "occupation": occupation,
+        "household": household,
+        "region": region,
+        "persona_type": persona_type,
+        "gender_identity": gender_identity,
+        "ethnicity": ethnicity,
+        "tech_comfort": tech_comfort,
+        "daily_context": daily_context,
+        "budget_sensitivity": budget_sensitivity,
+        "memory_stream": memory_stream,
+    }
+
+    return {key: value for key, value in seed.items() if value}
+
+
+def _extract_memory_text_from_row(row: dict[str, Any]) -> str:
+    candidates: list[str] = []
+
+    for key in [
+        "question_title",
+        "question_content",
+        "best_answer",
+        "summary",
+        "text",
+        "content",
+        "review_text",
+        "body",
+        "title",
+        "question",
+        "answer",
+        "bio",
+        "background",
+        "description",
+        "profile",
+        "persona",
+        "opinion",
+        "experience",
+    ]:
+        cleaned = _normalize_memory_seed_text(row.get(key))
+        if cleaned:
+            candidates.append(cleaned)
+
+    if not candidates:
+        return ""
+
+    combined = " | ".join(candidates[:3])
+    return _normalize_memory_seed_text(combined, max_chars=420)
+
+
+def _load_hf_memory_pool_sync(sample_size: int) -> list[str]:
+    if load_dataset is None:
+        return []
+
+    min_pool = max(1, HF_MEMORY_POOL_MIN)
+    max_pool = max(min_pool, HF_MEMORY_POOL_MAX)
+    requested = max(min_pool, min(max_pool, sample_size))
+
+    try:
+        start_pct = random.randint(0, 97)
+        end_pct = min(100, start_pct + 2)
+        split = f"train[{start_pct}%:{end_pct}%]"
+        dataset = load_dataset(HF_MEMORY_DATASET, split=split)
+    except Exception:
+        return []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    try:
+        for row in dataset:
+            if not isinstance(row, dict):
+                continue
+            text = _extract_memory_text_from_row(row)
+            if not text:
+                continue
+            lowered = text.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            candidates.append(text)
+            if len(candidates) >= requested * 5:
+                break
+    except Exception:
+        return []
+
+    random.shuffle(candidates)
+    return candidates[:requested]
+
+
+def _sample_from_pool(pool: list[str], sample_count: int) -> list[str]:
+    clean_pool = [_normalize_memory_seed_text(item) for item in pool if _normalize_memory_seed_text(item)]
+    if not clean_pool:
+        return []
+    if len(clean_pool) >= sample_count:
+        return random.sample(clean_pool, sample_count)
+    return [random.choice(clean_pool) for _ in range(sample_count)]
+
+
+async def _get_real_world_memory_pool() -> list[str]:
+    global _real_world_memory_cache
+    global _real_world_memory_cache_at
+
+    now = time.time()
+    if (
+        _real_world_memory_cache
+        and (now - _real_world_memory_cache_at) < HF_MEMORY_CACHE_TTL_SEC
+    ):
+        return _real_world_memory_cache.copy()
+
+    target_size = random.randint(
+        max(1, HF_MEMORY_POOL_MIN),
+        max(max(1, HF_MEMORY_POOL_MIN), HF_MEMORY_POOL_MAX),
+    )
+    loaded = await asyncio.to_thread(_load_hf_memory_pool_sync, target_size)
+
+    if loaded:
+        _real_world_memory_cache = loaded
+        _real_world_memory_cache_at = now
+        return loaded.copy()
+
+    _real_world_memory_cache = FALLBACK_REAL_WORLD_MEMORIES.copy()
+    _real_world_memory_cache_at = now
+    return _real_world_memory_cache.copy()
+
+
+def _normalize_tech_comfort(raw: str) -> str:
+    lowered = raw.lower()
+    if any(token in lowered for token in ["high", "expert", "advanced", "power"]):
+        return "high"
+    if any(token in lowered for token in ["low", "beginner", "novice", "minimal"]):
+        return "low"
+    return "medium"
+
+
+def _persona_seed_fingerprint(seed: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            _safe_str(seed.get("name"), "").lower(),
+            _safe_str(seed.get("occupation"), "").lower(),
+            _safe_str(seed.get("persona_type"), "").lower(),
+            _safe_str(seed.get("region"), "").lower(),
+            ";".join(_normalize_string_list(seed.get("memory_stream"), [])),
+        ]
+    )
+
+
+def _safe_dataset_split_names(dataset_name: str) -> list[str]:
+    split_names: list[str] = []
+    if get_dataset_split_names is not None:
+        try:
+            names = get_dataset_split_names(dataset_name)
+            if isinstance(names, list):
+                split_names = [str(name) for name in names if str(name).strip()]
+        except Exception:
+            split_names = []
+
+    ordered: list[str] = []
+    for value in [*split_names, "train", "validation", "test"]:
+        cleaned = _clean_optional_str(value)
+        if cleaned and cleaned not in ordered:
+            ordered.append(cleaned)
+
+    return ordered or ["train"]
+
+
+def _load_hf_persona_pool_sync(sample_size: int) -> list[dict[str, Any]]:
+    if load_dataset is None:
+        return []
+
+    dataset_candidates = _dataset_candidates(
+        HF_PERSONA_DATASET,
+        HF_PERSONA_DATASET_FALLBACKS,
+    )
+    if not dataset_candidates:
+        return []
+
+    min_pool = max(1, HF_PERSONA_POOL_MIN)
+    max_pool = max(min_pool, HF_PERSONA_POOL_MAX)
+    requested = max(min_pool, min(max_pool, sample_size))
+
+    collected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for dataset_name in dataset_candidates:
+        split_names = _safe_dataset_split_names(dataset_name)
+
+        for split_name in split_names:
+            start_pct = random.randint(0, 97)
+            end_pct = min(100, start_pct + 2)
+            split_slice = f"{split_name}[{start_pct}%:{end_pct}%]"
+
+            datasets_to_scan = []
+            try:
+                datasets_to_scan.append(load_dataset(dataset_name, split=split_slice))
+            except Exception:
+                pass
+
+            if not datasets_to_scan:
+                try:
+                    stream_ds = load_dataset(dataset_name, split=split_name, streaming=True)
+                    datasets_to_scan.append(stream_ds)
+                except Exception:
+                    pass
+
+            for dataset_obj in datasets_to_scan:
+                try:
+                    skip = random.randint(0, 150)
+                    idx = 0
+                    for row in dataset_obj:
+                        if idx < skip:
+                            idx += 1
+                            continue
+                        idx += 1
+
+                        if not isinstance(row, dict):
+                            continue
+                        seed = _normalize_hf_persona_seed_row(row)
+                        if not seed:
+                            continue
+
+                        fingerprint = _persona_seed_fingerprint(seed)
+                        if fingerprint in seen:
+                            continue
+                        seen.add(fingerprint)
+                        collected.append(seed)
+                        if len(collected) >= requested * 4:
+                            break
+                except Exception:
+                    continue
+
+            if len(collected) >= requested:
+                break
+
+        if len(collected) >= requested:
+            break
+
+    random.shuffle(collected)
+    return collected[:requested]
+
+
+def _query_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]{3,}", text.lower())}
+
+
+def _persona_seed_corpus(seed: dict[str, Any]) -> str:
+    parts = [
+        _safe_str(seed.get("name"), ""),
+        _safe_str(seed.get("age_range"), ""),
+        _safe_str(seed.get("occupation"), ""),
+        _safe_str(seed.get("household"), ""),
+        _safe_str(seed.get("region"), ""),
+        _safe_str(seed.get("persona_type"), ""),
+        _safe_str(seed.get("gender_identity"), ""),
+        _safe_str(seed.get("ethnicity"), ""),
+        _safe_str(seed.get("daily_context"), ""),
+        _safe_str(seed.get("budget_sensitivity"), ""),
+        " ".join(_normalize_string_list(seed.get("memory_stream"), [])),
+    ]
+    return " ".join([part for part in parts if part]).strip()
+
+
+def _token_overlap_score(query: set[str], doc: set[str]) -> float:
+    if not query or not doc:
+        return 0.0
+    overlap = len(query.intersection(doc))
+    return overlap / max(1, len(query))
+
+
+def _select_persona_seeds_for_audience(
+    seed_pool: list[dict[str, Any]],
+    target_audience: str,
+    stimulus_description: str,
+    desired_count: int,
+) -> list[dict[str, Any]]:
+    if not seed_pool:
+        return []
+
+    audience_tokens = _query_tokens(target_audience)
+    stimulus_tokens = _query_tokens(stimulus_description)
+
+    scored: list[dict[str, Any]] = []
+    for seed in seed_pool:
+        corpus_tokens = _query_tokens(_persona_seed_corpus(seed))
+        if not corpus_tokens:
+            continue
+        audience_score = _token_overlap_score(audience_tokens, corpus_tokens)
+        stimulus_score = _token_overlap_score(stimulus_tokens, corpus_tokens)
+        base_score = (0.7 * audience_score) + (0.3 * stimulus_score) + random.random() * 0.01
+        scored.append({"score": base_score, "seed": seed})
+
+    if not scored:
+        return seed_pool[: max(1, min(desired_count, len(seed_pool)))]
+
+    selected: list[dict[str, Any]] = []
+    remaining = scored[:]
+    occupation_counts: Counter[str] = Counter()
+    region_counts: Counter[str] = Counter()
+
+    target_count = max(1, min(desired_count, len(seed_pool)))
+    while remaining and len(selected) < target_count:
+        best_idx = 0
+        best_score = float("-inf")
+
+        for idx, entry in enumerate(remaining):
+            seed = entry["seed"]
+            occupation = _safe_str(seed.get("occupation"), "").lower()
+            region = _safe_str(seed.get("region"), "").lower()
+            penalty = 0.08 * occupation_counts.get(occupation, 0) + 0.04 * region_counts.get(region, 0)
+            adjusted = float(entry["score"]) - penalty
+            if adjusted > best_score:
+                best_idx = idx
+                best_score = adjusted
+
+        best_entry = remaining.pop(best_idx)
+        best_seed = best_entry["seed"]
+        selected.append(best_seed)
+
+        occupation = _safe_str(best_seed.get("occupation"), "").lower()
+        region = _safe_str(best_seed.get("region"), "").lower()
+        if occupation:
+            occupation_counts[occupation] += 1
+        if region:
+            region_counts[region] += 1
+
+    return selected
+
+
+async def _get_persona_seed_pool(
+    target_audience: str,
+    stimulus_description: str,
+    persona_count: int,
+) -> list[dict[str, Any]]:
+    global _persona_seed_cache
+    global _persona_seed_cache_at
+
+    now = time.time()
+    pool_is_fresh = _persona_seed_cache and (now - _persona_seed_cache_at) < HF_PERSONA_CACHE_TTL_SEC
+
+    if not pool_is_fresh:
+        desired_pool_size = max(
+            HF_PERSONA_POOL_MIN,
+            min(HF_PERSONA_POOL_MAX, max(persona_count * 3, HF_PERSONA_POOL_MIN)),
+        )
+        loaded = await asyncio.to_thread(_load_hf_persona_pool_sync, desired_pool_size)
+        if loaded:
+            _persona_seed_cache = loaded
+            _persona_seed_cache_at = now
+        else:
+            _persona_seed_cache = []
+            _persona_seed_cache_at = now
+
+    base_pool = [dict(entry) for entry in _persona_seed_cache]
+    if not base_pool:
+        return []
+
+    selected = _select_persona_seeds_for_audience(
+        base_pool,
+        target_audience=target_audience,
+        stimulus_description=stimulus_description,
+        desired_count=max(1, min(len(base_pool), max(persona_count, HF_PERSONA_POOL_MIN))),
+    )
+    return [dict(entry) for entry in selected]
+
+
+def _merge_blueprint_with_persona_seed(
+    blueprint: dict[str, Any],
+    persona_seed: dict[str, Any],
+) -> dict[str, Any]:
+    if not persona_seed:
+        return blueprint
+
+    merged = dict(blueprint)
+    for key in [
+        "name",
+        "age_range",
+        "occupation",
+        "household",
+        "region",
+        "persona_type",
+        "gender_identity",
+        "ethnicity",
+        "daily_context",
+    ]:
+        value = _safe_str(persona_seed.get(key), "")
+        if value:
+            merged[key] = value
+
+    budget = _safe_str(persona_seed.get("budget_sensitivity"), "")
+    if budget:
+        merged["budget_sensitivity"] = _normalize_budget_sensitivity(budget)
+
+    tech = _safe_str(persona_seed.get("tech_comfort"), "")
+    if tech:
+        merged["tech_comfort"] = _normalize_tech_comfort(tech)
+
+    seed_memories = _normalize_string_list(persona_seed.get("memory_stream"), [])
+    existing_memories = _normalize_string_list(merged.get("memory_stream"), [])
+    combined = [*existing_memories]
+    for memory in seed_memories:
+        if memory not in combined:
+            combined.append(memory)
+    merged["memory_stream"] = combined
+
+    return merged
 
 
 def _default_target_audience(stimulus_description: str) -> str:
@@ -560,13 +1197,8 @@ def _dimension_score_default(
     *,
     index: int,
     key_index: int,
-    sentiment_target: str,
 ) -> int:
     base = 48 + ((index * 9 + key_index * 7) % 20)
-    if sentiment_target == "positive":
-        base += 7
-    elif sentiment_target == "negative":
-        base -= 7
     return _safe_int(base, 50)
 
 
@@ -642,7 +1274,6 @@ def _sanitize_persona_claims(persona: dict[str, Any], stimulus_description: str)
 
 
 def _fallback_blueprints(persona_count: int) -> list[dict[str, Any]]:
-    targets = _sentiment_targets(persona_count)
     random_seed = int(time.time()) % 10_000
     rng = random.Random(random_seed)
 
@@ -664,14 +1295,7 @@ def _fallback_blueprints(persona_count: int) -> list[dict[str, Any]]:
 
     blueprints: list[dict[str, Any]] = []
     for idx in range(persona_count):
-        sentiment_target = targets[idx]
-        stance = (
-            "champion"
-            if sentiment_target == "positive"
-            else "skeptic"
-            if sentiment_target == "negative"
-            else "fence-sitter"
-        )
+        stance = ["champion", "fence-sitter", "skeptic"][idx % 3]
 
         blueprints.append(
             {
@@ -686,38 +1310,37 @@ def _fallback_blueprints(persona_count: int) -> list[dict[str, Any]]:
                 "tech_comfort": ["low", "medium", "high"][idx % 3],
                 "daily_context": contexts[idx % len(contexts)],
                 "budget_sensitivity": ["high", "medium", "low"][idx % 3],
-                "sentiment_target": sentiment_target,
                 "stance": stance,
                 "must_include": [
                     "one concrete usability concern",
                     "one realistic tradeoff",
                     "one contextual stress trigger",
                 ],
+                "memory_stream": [],
             }
         )
 
     return blueprints
 
 
-def _normalize_blueprint_entry(
-    payload: dict[str, Any],
-    index: int,
-    sentiment_target: str,
-) -> dict[str, Any]:
+def _normalize_blueprint_entry(payload: dict[str, Any], index: int) -> dict[str, Any]:
     stance = _safe_str(payload.get("stance"), "fence-sitter").lower()
     if stance not in {"champion", "fence-sitter", "skeptic"}:
-        stance = (
-            "champion"
-            if sentiment_target == "positive"
-            else "skeptic"
-            if sentiment_target == "negative"
-            else "fence-sitter"
-        )
+        stance = "fence-sitter"
 
     daily_context = _safe_str(
         payload.get("daily_context"),
         _safe_str(payload.get("driving_context"), "weekday routine with competing demands"),
     )
+
+    memory_stream_raw = payload.get("memory_stream", [])
+    memory_stream = []
+    if isinstance(memory_stream_raw, list):
+        memory_stream = [
+            _normalize_memory_seed_text(item)
+            for item in memory_stream_raw
+            if _normalize_memory_seed_text(item)
+        ]
 
     return {
         "name": _safe_str(payload.get("name"), f"Persona {index + 1}"),
@@ -732,8 +1355,8 @@ def _normalize_blueprint_entry(
         "daily_context": daily_context,
         "driving_context": daily_context,
         "budget_sensitivity": _safe_str(payload.get("budget_sensitivity"), "medium").lower(),
-        "sentiment_target": sentiment_target,
         "stance": stance,
+        "memory_stream": memory_stream,
         "must_include": [
             _safe_str(item, "")
             for item in payload.get("must_include", [])
@@ -745,10 +1368,9 @@ def _normalize_blueprint_entry(
 async def _build_diversity_blueprints(
     target_audience: str,
     stimulus_description: str,
+    task_type: str,
     persona_count: int,
 ) -> list[dict[str, Any]]:
-    sentiment_targets = _sentiment_targets(persona_count)
-
     system_prompt = (
         "You are designing a synthetic focus group panel. Create highly diverse personas with "
         "distinct names, occupations, life constraints, and opinions. Return strict JSON."
@@ -761,8 +1383,10 @@ Target audience:
 Stimulus:
 {stimulus_description}
 
+Task type:
+{task_type}
+
 Create exactly {persona_count} panel_blueprints with maximum diversity.
-You MUST include sentiment mix across positive, neutral, negative.
 Avoid repeating occupations or near-identical names.
 
 Return JSON with key panel_blueprints: array of objects, each with keys:
@@ -783,6 +1407,7 @@ Return JSON with key panel_blueprints: array of objects, each with keys:
 Rules:
 - Persona details must feel plausible for the stimulus category.
 - Avoid fabricated objective claims (health, legal, safety, scientific) unless directly supported.
+- Do NOT force any sentiment distribution. Let sentiment emerge organically from persona context.
 """
 
     raw_panel: list[dict[str, Any]] = []
@@ -803,10 +1428,22 @@ Rules:
 
     normalized: list[dict[str, Any]] = []
     used_names: set[str] = set()
+    persona_seed_pool = await _get_persona_seed_pool(
+        target_audience=target_audience,
+        stimulus_description=stimulus_description,
+        persona_count=persona_count,
+    )
+    if persona_seed_pool:
+        random.shuffle(persona_seed_pool)
 
     for idx in range(persona_count):
         source = raw_panel[idx] if idx < len(raw_panel) else {}
-        entry = _normalize_blueprint_entry(source, idx, sentiment_targets[idx])
+        entry = _normalize_blueprint_entry(source, idx)
+        if persona_seed_pool:
+            entry = _merge_blueprint_with_persona_seed(
+                entry,
+                persona_seed_pool[idx % len(persona_seed_pool)],
+            )
 
         base_name = entry["name"]
         unique_name = base_name
@@ -819,6 +1456,21 @@ Rules:
 
         normalized.append(entry)
 
+    memory_pool = await _get_real_world_memory_pool()
+    min_mem = max(1, HF_MEMORY_PER_PERSONA_MIN)
+    max_mem = max(min_mem, HF_MEMORY_PER_PERSONA_MAX)
+
+    for entry in normalized:
+        per_persona_count = random.randint(min_mem, max_mem)
+        assigned = _sample_from_pool(memory_pool, per_persona_count)
+        if assigned:
+            entry["memory_stream"] = assigned
+        elif not entry.get("memory_stream"):
+            entry["memory_stream"] = _sample_from_pool(
+                FALLBACK_REAL_WORLD_MEMORIES,
+                per_persona_count,
+            )
+
     return normalized
 
 
@@ -827,15 +1479,6 @@ def _default_persona(
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
 ) -> dict[str, Any]:
-    sentiment_target = _safe_str(blueprint.get("sentiment_target"), "neutral")
-    target_score = (
-        0.45
-        if sentiment_target == "positive"
-        else -0.45
-        if sentiment_target == "negative"
-        else 0.0
-    )
-
     dimension_specs = analysis_dimensions or _fallback_dimension_specs()
     cognitive_load: dict[str, int] = {}
     for key_index, spec in enumerate(dimension_specs):
@@ -843,7 +1486,6 @@ def _default_persona(
         cognitive_load[key] = _dimension_score_default(
             index=index,
             key_index=key_index,
-            sentiment_target=sentiment_target,
         )
 
     daily_context = _safe_str(
@@ -869,10 +1511,10 @@ def _default_persona(
         "driving_context": daily_context,
         "budget_sensitivity": _safe_str(blueprint.get("budget_sensitivity"), "medium"),
         "stance": _safe_str(blueprint.get("stance"), "fence-sitter"),
-        "sentiment_target": sentiment_target,
+        "sentiment_target": "organic",
         "stress_level": 65,
-        "sentiment_score": target_score,
-        "sentiment_label": sentiment_target,
+        "sentiment_score": 0.0,
+        "sentiment_label": "neutral",
         "cognitive_load": cognitive_load,
         "reaction_summary": "I evaluate this based on real-world fit, trust, and practical tradeoffs.",
         "quote": "If this helps in my actual routine, I can get behind it.",
@@ -882,6 +1524,7 @@ def _default_persona(
         ],
         "concerns": ["Some claims feel too broad without proof", "I need clearer tradeoff details"],
         "delights": ["Clear message hierarchy", "Feels relevant to my real context"],
+        "memory_stream": _normalize_string_list(blueprint.get("memory_stream"), []),
     }
 
 
@@ -921,22 +1564,22 @@ def _normalize_persona(
             key_index=key_index,
         )
 
-    sentiment_target = _safe_str(blueprint.get("sentiment_target"), "neutral")
     sentiment_score = _safe_float(
         payload.get("sentiment_score"),
         _safe_float(default_persona.get("sentiment_score"), 0.0),
     )
 
-    sentiment_label = _safe_str(payload.get("sentiment_label"), sentiment_target).lower()
+    sentiment_label = _safe_str(
+        payload.get("sentiment_label"),
+        _safe_str(default_persona.get("sentiment_label"), "neutral"),
+    ).lower()
     if sentiment_label not in {"positive", "neutral", "negative"}:
-        sentiment_label = sentiment_target
-
-    if sentiment_target == "positive" and sentiment_score < 0.15:
-        sentiment_score = max(0.15, abs(sentiment_score))
-    if sentiment_target == "negative" and sentiment_score > -0.15:
-        sentiment_score = -max(0.15, abs(sentiment_score))
-    if sentiment_target == "neutral":
-        sentiment_score = max(-0.25, min(0.25, sentiment_score))
+        if sentiment_score > 0.15:
+            sentiment_label = "positive"
+        elif sentiment_score < -0.15:
+            sentiment_label = "negative"
+        else:
+            sentiment_label = "neutral"
 
     daily_context = _safe_str(
         payload.get("daily_context"),
@@ -987,7 +1630,10 @@ def _normalize_persona(
         "stance": _safe_str(
             payload.get("stance"), _safe_str(default_persona["stance"], "fence-sitter")
         ),
-        "sentiment_target": sentiment_target,
+        "sentiment_target": _safe_str(
+            payload.get("sentiment_target"),
+            _safe_str(default_persona.get("sentiment_target"), "organic"),
+        ),
         "stress_level": _safe_int(
             payload.get("stress_level"), _safe_int(default_persona["stress_level"], 65)
         ),
@@ -1011,6 +1657,10 @@ def _normalize_persona(
             payload.get("delights"),
             _normalize_string_list(default_persona.get("delights"), []),
         ),
+        "memory_stream": _normalize_string_list(
+            payload.get("memory_stream"),
+            _normalize_string_list(default_persona.get("memory_stream"), []),
+        ),
     }
 
     return _sanitize_persona_claims(normalized, stimulus_description)
@@ -1020,6 +1670,7 @@ def _persona_seed_prompt(
     target_audience: str,
     stimulus_description: str,
     image_url: str | None,
+    task_type: str,
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
     index: int,
@@ -1049,6 +1700,15 @@ def _persona_seed_prompt(
         blueprint.get("daily_context"),
         _safe_str(blueprint.get("driving_context"), "weekday routine with competing demands"),
     )
+    memory_stream = _normalize_string_list(blueprint.get("memory_stream"), [])
+    memory_stream_text = (
+        "\n".join([f"- {item}" for item in memory_stream]) if memory_stream else "- none"
+    )
+    task_type_guidance = (
+        "Focus on factual UI observations. Be concrete and verifiable. Avoid broad brand-opinion language."
+        if task_type == "Objective UI Task"
+        else "Focus on authentic preference, trust, and tradeoff judgments rooted in lived experience."
+    )
 
     user_prompt = f"""
 Generate participant {index + 1} of {total}.
@@ -1056,6 +1716,7 @@ Generate participant {index + 1} of {total}.
 Target audience: {target_audience}
 Stimulus: {stimulus_description}
 Stimulus image URL (optional context): {image_url or "none"}
+Task type: {task_type}
 
 Persona blueprint (must follow):
 - name: {blueprint.get("name")}
@@ -1070,10 +1731,12 @@ Persona blueprint (must follow):
 - daily_context: {daily_context}
 - budget_sensitivity: {blueprint.get("budget_sensitivity")}
 - stance: {blueprint.get("stance")}
-- required sentiment target: {blueprint.get("sentiment_target")}
 
 Mandatory content points:
 {must_include_text}
+
+Real-world memory stream (past experiences/core opinions). Draw on these when reacting:
+{memory_stream_text}
 
 Evaluation dimensions (use exactly these keys in cognitive_load):
 {dimension_details}
@@ -1104,11 +1767,11 @@ Return exactly one JSON object with keys:
 
 Rules:
 - Keep this persona distinct from generic answers.
-- Match sentiment_label and sentiment_score direction to required sentiment target.
-- Even positive personas should mention at least one concern.
-- Even skeptical personas should mention at least one potential upside.
+- Sentiment must emerge organically from memory stream + stimulus, do not force distribution.
+- Mention at least one concrete concern and one potential upside.
 - Do not invent objective claims (health/safety/legal/scientific) unless clearly supported by the stimulus.
 - If the stimulus is fast food or indulgent food, do not call it healthy.
+- {task_type_guidance}
 """
     return system_prompt, user_prompt
 
@@ -1117,6 +1780,7 @@ async def _generate_one_persona(
     target_audience: str,
     stimulus_description: str,
     image_url: str | None,
+    task_type: str,
     persona_count: int,
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
@@ -1128,6 +1792,7 @@ async def _generate_one_persona(
             target_audience=target_audience,
             stimulus_description=stimulus_description,
             image_url=image_url,
+            task_type=task_type,
             blueprint=blueprint,
             analysis_dimensions=analysis_dimensions,
             index=index,
@@ -1147,12 +1812,14 @@ async def _generate_one_persona(
         profile = {
             "agent_id": agent_id,
             "stimulus_description": stimulus_description,
+            "task_type": task_type,
             **normalized,
         }
 
         memory_texts = [
             f"Persona type: {profile.get('persona_type', '')}",
             f"Daily context: {profile.get('daily_context', profile.get('driving_context', ''))}",
+            "Memory stream: " + " | ".join(_normalize_string_list(profile.get("memory_stream"), [])),
             profile.get("reaction_summary", ""),
             profile.get("quote", ""),
             "Reasons: " + "; ".join(profile.get("reasons", [])),
@@ -1361,6 +2028,7 @@ async def health() -> dict[str, Any]:
         "model": OPENAI_MODEL,
         "model_fallbacks": OPENAI_MODEL_FALLBACKS,
         "embedding_model": OPENAI_EMBEDDING_MODEL,
+        "persona_dataset": HF_PERSONA_DATASET,
         "persona_store_size": await store.size(),
     }
 
@@ -1371,6 +2039,8 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
         requested_target=request.target_audience,
         stimulus_description=request.stimulus_description,
     )
+    task_type_info = await _classify_task_type(request.stimulus_description)
+    task_type = _safe_str(task_type_info.get("task_type"), "Subjective Concept")
 
     resolved_target_audience = audience_info["target_audience"]
     analysis_dimensions = await _resolve_analysis_dimensions(
@@ -1382,6 +2052,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
     blueprints = await _build_diversity_blueprints(
         target_audience=resolved_target_audience,
         stimulus_description=request.stimulus_description,
+        task_type=task_type,
         persona_count=request.persona_count,
     )
 
@@ -1391,6 +2062,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
             target_audience=resolved_target_audience,
             stimulus_description=request.stimulus_description,
             image_url=request.image_url,
+            task_type=task_type,
             persona_count=request.persona_count,
             blueprint=blueprints[index],
             analysis_dimensions=analysis_dimensions,
@@ -1416,6 +2088,8 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
                 agent_id=fallback_agent_id,
                 profile={
                     "agent_id": fallback_agent_id,
+                    "stimulus_description": request.stimulus_description,
+                    "task_type": task_type,
                     **fallback_profile,
                     "generation_error": str(result),
                 },
@@ -1451,6 +2125,8 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
         ),
         "stimulus_description": request.stimulus_description,
         "image_url": request.image_url,
+        "task_type": task_type,
+        "task_type_rationale": _safe_str(task_type_info.get("task_type_rationale"), ""),
         "analysis_dimensions": analysis_dimensions,
         "manager_summary": manager_summary,
         "personas": persona_payloads,
