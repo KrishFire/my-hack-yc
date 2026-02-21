@@ -18,10 +18,15 @@ coverage/
 
 # Environment
 .env
+.venv/
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Python
+__pycache__/
+*.pyc
 
 # Logs
 *.log
@@ -41,4 +46,3 @@ Thumbs.db
 *.swp
 *.swo
 *~
-

@@ -18,6 +18,25 @@ Open [http://localhost:3000/inspector](http://localhost:3000/inspector) to test 
 
 You can start building by editing `index.ts`. Add tools, resources, and prompts — the server auto-reloads as you edit thanks to Hot Module Reloading (HMR).
 
+## Local Focus Group Backend (Required for this app)
+
+This MCP app expects a local FastAPI service at `http://127.0.0.1:8000`.
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export OPENAI_API_KEY="<your-key>"
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Then run the MCP app from repo root:
+
+```bash
+npm run dev
+```
+
 ## Connecting to Claude or ChatGPT
 
 ### Local testing with tunnel
@@ -93,4 +112,3 @@ Subsequent `npm run deploy` calls redeploy to the same URL
 - [Model Context Protocol](https://modelcontextprotocol.io/) — the open standard powering MCP servers
 - [Goose](https://block.github.io/goose/docs/quickstart/) — free open-source MCP client
 - [MCP Apps Hackathon](https://events.ycombinator.com/manufact-hackathon26) — event page
-

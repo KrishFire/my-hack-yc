@@ -54,7 +54,16 @@ const ProductSearchResult: React.FC = () => {
     callTool: getFruitDetails,
     data: fruitDetails,
     isPending: isLoadingDetails,
-  } = useCallTool("get-fruit-details");
+  } = useCallTool<
+    { fruit: string },
+    {
+      structuredContent?: {
+        fruit: string;
+        color?: string;
+        facts?: string[];
+      };
+    }
+  >("get-fruit-details");
 
   const selectedFruit = fruitDetails?.structuredContent as
     | { fruit: string; facts?: string[] }
