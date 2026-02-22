@@ -1,4 +1,4 @@
-# Synthetic Focus Group MCP App
+# Synthetic Focus Group MCP App - Pneuma
 
 An interactive MCP app for running fast, grounded synthetic focus groups on ads, product concepts, and UI experiences.
 
