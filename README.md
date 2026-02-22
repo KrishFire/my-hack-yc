@@ -79,5 +79,4 @@ Use the printed URL (example):
 Then add that MCP URL:
 - Claude: Settings → Integrations → Add integration
 - ChatGPT: Settings → Connectors → Add MCP server
-// End of Selection
 ```
