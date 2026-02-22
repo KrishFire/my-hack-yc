@@ -171,6 +171,135 @@ OBJECTIVE_UI_HINTS = [
     "form field",
     "error message",
 ]
+PREMIUM_AUDIENCE_HINTS = [
+    "upper class",
+    "upper-class",
+    "affluent",
+    "wealthy",
+    "high income",
+    "high-income",
+    "high net worth",
+    "high-net-worth",
+    "hnwi",
+    "luxury",
+    "upscale",
+    "premium",
+    "private school",
+    "country club",
+]
+VALUE_AUDIENCE_HINTS = [
+    "budget",
+    "price-sensitive",
+    "price sensitive",
+    "value-conscious",
+    "value conscious",
+    "working class",
+    "low income",
+    "low-income",
+    "middle class",
+    "middle-class",
+    "frugal",
+    "bargain",
+    "deal-seeking",
+    "deal seeking",
+]
+DISCOUNT_STIMULUS_HINTS = [
+    "ross",
+    "tj maxx",
+    "marshalls",
+    "burlington",
+    "outlet",
+    "clearance",
+    "discount",
+    "bargain",
+    "value",
+    "off-price",
+    "off price",
+    "dollar tree",
+    "dollar general",
+    "thrift",
+    "walmart",
+]
+PREMIUM_STIMULUS_HINTS = [
+    "luxury",
+    "premium",
+    "upscale",
+    "designer",
+    "exclusive",
+    "high-end",
+    "high end",
+    "rolex",
+    "gucci",
+    "louis vuitton",
+    "chanel",
+    "prada",
+]
+SENTIMENT_STRONG_NEGATIVE_CUES = [
+    "not convinced",
+    "not entirely convinced",
+    "doesn't resonate",
+    "does not resonate",
+    "doesn't align",
+    "does not align",
+    "not for me",
+    "would not buy",
+    "wouldn't buy",
+    "would not shop",
+    "wouldn't shop",
+    "low quality",
+    "cheap-looking",
+    "off-brand",
+    "wrong fit",
+]
+SENTIMENT_NEGATIVE_CUES = [
+    "skeptical",
+    "hesitant",
+    "concerned",
+    "doubt",
+    "unconvinced",
+    "not sure",
+    "torn",
+    "mixed feelings",
+    "unsure",
+    "doesn't capture",
+    "does not capture",
+    "too budget",
+    "too basic",
+    "misaligned",
+]
+SENTIMENT_STRONG_POSITIVE_CUES = [
+    "strong fit",
+    "perfect fit",
+    "fully convinced",
+    "definitely buy",
+    "would absolutely buy",
+    "love this",
+    "exactly what i need",
+    "resonates strongly",
+]
+SENTIMENT_POSITIVE_CUES = [
+    "appealing",
+    "resonates",
+    "aligns",
+    "convinced",
+    "good fit",
+    "high quality",
+    "great value",
+    "trust",
+    "would buy",
+    "would shop",
+    "recommend",
+    "excited",
+]
+SENTIMENT_UNCERTAIN_CUES = [
+    "torn",
+    "on the fence",
+    "undecided",
+    "hard to decide",
+    "could go either way",
+    "not sure",
+    "mixed feelings",
+]
 FALLBACK_REAL_WORLD_MEMORIES = [
     "I bought a product once because the reviews sounded convincing, but it underdelivered in daily use.",
     "I usually ignore flashy ads and look for practical details, especially return policy and long-term value.",
@@ -195,18 +324,15 @@ class SimulateRequest(BaseModel):
     stimulus_description: str = Field(min_length=3)
     image_url: str | None = None
     persona_count: int = Field(default=DEFAULT_PERSONA_COUNT, ge=3, le=MAX_PERSONA_COUNT)
-    analysis_dimensions: list[str] | None = Field(
-        default=None,
-        description=(
-            "Optional custom evaluation dimensions (e.g. ['Trust', 'Clarity']). "
-            "Backend can mix these with auto-generated dimensions."
-        ),
-    )
 
 
 class FollowupRequest(BaseModel):
     agent_id: str = Field(min_length=3)
     question: str = Field(min_length=2)
+    persona_profile: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional persona profile snapshot used if agent_id is missing from live store.",
+    )
 
 
 @dataclass
@@ -525,6 +651,257 @@ def _heuristic_task_type(stimulus_description: str) -> str:
     if any(hint in normalized for hint in OBJECTIVE_UI_HINTS):
         return "Objective UI Task"
     return "Subjective Concept"
+
+
+def _contains_any_hint(text: str, hints: list[str]) -> bool:
+    return any(hint in text for hint in hints)
+
+
+def _audience_price_profile(target_audience: str) -> str:
+    normalized = target_audience.lower()
+    premium_hits = sum(1 for hint in PREMIUM_AUDIENCE_HINTS if hint in normalized)
+    value_hits = sum(1 for hint in VALUE_AUDIENCE_HINTS if hint in normalized)
+
+    if premium_hits > value_hits and premium_hits > 0:
+        return "premium"
+    if value_hits > premium_hits and value_hits > 0:
+        return "value"
+    return "mixed"
+
+
+def _stimulus_price_position(stimulus_description: str) -> str:
+    normalized = stimulus_description.lower()
+    discount_hits = sum(1 for hint in DISCOUNT_STIMULUS_HINTS if hint in normalized)
+    premium_hits = sum(1 for hint in PREMIUM_STIMULUS_HINTS if hint in normalized)
+
+    if discount_hits > premium_hits and discount_hits > 0:
+        return "discount"
+    if premium_hits > discount_hits and premium_hits > 0:
+        return "premium"
+    return "neutral"
+
+
+def _build_market_fit_context(
+    target_audience: str,
+    stimulus_description: str,
+    task_type: str,
+) -> dict[str, Any]:
+    if task_type == "Objective UI Task":
+        return {
+            "fit_signal": "not_applicable",
+            "audience_price_profile": "not_applicable",
+            "stimulus_price_position": "not_applicable",
+            "sentiment_bias": 0.0,
+            "stance_hint": "fence-sitter",
+            "rationale": "Objective UI task focuses on factual checks, not brand-positioning sentiment.",
+        }
+
+    audience_profile = _audience_price_profile(target_audience)
+    stimulus_position = _stimulus_price_position(stimulus_description)
+
+    fit_signal = "neutral"
+    sentiment_bias = 0.0
+    stance_hint = "mixed"
+    rationale = "No strong audience-positioning fit signal detected."
+
+    if audience_profile == "premium" and stimulus_position == "discount":
+        fit_signal = "mismatch"
+        sentiment_bias = -0.45
+        stance_hint = "skeptical"
+        rationale = (
+            "Audience skews affluent while stimulus is value/discount positioned, "
+            "which often triggers quality and status skepticism."
+        )
+    elif audience_profile == "value" and stimulus_position == "premium":
+        fit_signal = "mismatch"
+        sentiment_bias = -0.35
+        stance_hint = "skeptical"
+        rationale = (
+            "Audience skews price-sensitive while stimulus is premium positioned, "
+            "which often triggers affordability skepticism."
+        )
+    elif audience_profile == "premium" and stimulus_position == "premium":
+        fit_signal = "aligned"
+        sentiment_bias = 0.12
+        stance_hint = "open_positive"
+        rationale = "Audience and stimulus both signal premium positioning."
+    elif audience_profile == "value" and stimulus_position == "discount":
+        fit_signal = "aligned"
+        sentiment_bias = 0.12
+        stance_hint = "open_positive"
+        rationale = "Audience and stimulus both signal value/discount positioning."
+
+    return {
+        "fit_signal": fit_signal,
+        "audience_price_profile": audience_profile,
+        "stimulus_price_position": stimulus_position,
+        "sentiment_bias": sentiment_bias,
+        "stance_hint": stance_hint,
+        "rationale": rationale,
+    }
+
+
+def _stable_bucket(*parts: Any) -> int:
+    text = "|".join([_safe_str(part, "") for part in parts])
+    return sum(ord(ch) for ch in text) % 100
+
+
+def _enforce_subjective_directionality(
+    sentiment_score: float,
+    stance: str,
+    market_fit_context: dict[str, Any],
+    index: int,
+    persona_name: str,
+) -> float:
+    if abs(sentiment_score) >= 0.08:
+        return sentiment_score
+
+    fit_signal = _safe_str(market_fit_context.get("fit_signal"), "neutral")
+    sentiment_bias = _safe_float(market_fit_context.get("sentiment_bias"), 0.0, -0.8, 0.3)
+    bucket = _stable_bucket(index, persona_name, fit_signal, sentiment_bias)
+
+    neutral_threshold = 2
+    if stance == "fence-sitter":
+        neutral_threshold = 6
+    if fit_signal == "mismatch":
+        neutral_threshold = 1
+
+    if bucket < neutral_threshold:
+        return 0.0
+
+    if stance == "champion" or sentiment_bias > 0.1:
+        direction = 1.0
+    elif stance == "skeptic" or sentiment_bias < -0.1 or fit_signal == "mismatch":
+        direction = -1.0
+    else:
+        direction = -1.0 if bucket % 2 == 0 else 1.0
+
+    magnitude = 0.16 if stance == "fence-sitter" else 0.28
+    return direction * magnitude
+
+
+def _sentiment_label_from_score(score: float) -> str:
+    if score >= 0.08:
+        return "positive"
+    if score <= -0.08:
+        return "negative"
+    return "neutral"
+
+
+def _sentiment_intensity_from_score(score: float) -> str:
+    if score >= 0.55:
+        return "firmly_positive"
+    if score >= 0.08:
+        return "leaning_positive"
+    if score <= -0.55:
+        return "firmly_negative"
+    if score <= -0.08:
+        return "leaning_negative"
+    return "truly_neutral"
+
+
+def _phrase_hits(text: str, phrases: list[str]) -> int:
+    lowered = text.lower()
+    return sum(1 for phrase in phrases if phrase in lowered)
+
+
+def _persona_text_blob(profile: dict[str, Any]) -> str:
+    parts: list[str] = [
+        _safe_str(profile.get("reaction_summary"), ""),
+        _safe_str(profile.get("quote"), ""),
+    ]
+    for list_key in ["reasons", "concerns", "delights"]:
+        values = profile.get(list_key, [])
+        if isinstance(values, list):
+            parts.extend([_safe_str(item, "") for item in values if _safe_str(item, "")])
+    return " ".join(part for part in parts if part).strip().lower()
+
+
+def _textual_sentiment_evidence_score(profile: dict[str, Any]) -> float:
+    text = _persona_text_blob(profile)
+    if not text:
+        return 0.0
+
+    strong_negative_hits = _phrase_hits(text, SENTIMENT_STRONG_NEGATIVE_CUES)
+    negative_hits = _phrase_hits(text, SENTIMENT_NEGATIVE_CUES)
+    strong_positive_hits = _phrase_hits(text, SENTIMENT_STRONG_POSITIVE_CUES)
+    positive_hits = _phrase_hits(text, SENTIMENT_POSITIVE_CUES)
+    uncertain_hits = _phrase_hits(text, SENTIMENT_UNCERTAIN_CUES)
+
+    concerns = _normalize_string_list(profile.get("concerns"), [])
+    delights = _normalize_string_list(profile.get("delights"), [])
+
+    score = 0.0
+    score -= strong_negative_hits * 0.34
+    score -= negative_hits * 0.15
+    score += strong_positive_hits * 0.31
+    score += positive_hits * 0.12
+
+    score -= min(3, len(concerns)) * 0.09
+    score += min(3, len(delights)) * 0.08
+
+    if len(concerns) >= len(delights) + 1:
+        score -= 0.11
+    elif len(delights) >= len(concerns) + 1:
+        score += 0.09
+
+    if uncertain_hits > 0:
+        damp = max(0.45, 1.0 - (0.15 * uncertain_hits))
+        score *= damp
+
+    return _safe_float(score, 0.0, -1.0, 1.0)
+
+
+def _rescore_subjective_sentiment(
+    base_score: float,
+    profile: dict[str, Any],
+    stance: str,
+    market_fit_context: dict[str, Any],
+    index: int,
+) -> float:
+    fit_signal = _safe_str(market_fit_context.get("fit_signal"), "neutral")
+    textual_score = _textual_sentiment_evidence_score(profile)
+    combined = (0.35 * base_score) + (0.65 * textual_score)
+
+    if stance == "skeptic":
+        combined -= 0.12
+    elif stance == "champion":
+        combined += 0.08
+    else:
+        combined -= 0.02
+
+    if fit_signal == "mismatch":
+        combined -= 0.18
+    elif fit_signal == "aligned" and combined > 0:
+        combined += 0.08
+
+    text = _persona_text_blob(profile)
+    hard_negative = _phrase_hits(text, SENTIMENT_STRONG_NEGATIVE_CUES) > 0
+    hard_positive = _phrase_hits(text, SENTIMENT_STRONG_POSITIVE_CUES) > 0
+
+    if hard_negative and not hard_positive:
+        combined = min(combined, -0.24)
+    if hard_positive and not hard_negative:
+        combined = max(combined, 0.24)
+
+    if fit_signal == "mismatch" and combined < -0.35:
+        combined -= 0.16
+    if fit_signal == "aligned" and combined > 0.35:
+        combined += 0.12
+
+    combined = _safe_float(combined, 0.0, -1.0, 1.0)
+
+    if abs(combined) < 0.08:
+        persona_name = _safe_str(profile.get("name"), f"persona_{index + 1}")
+        combined = _enforce_subjective_directionality(
+            sentiment_score=combined,
+            stance=stance,
+            market_fit_context=market_fit_context,
+            index=index,
+            persona_name=persona_name,
+        )
+
+    return _safe_float(combined, 0.0, -1.0, 1.0)
 
 
 async def _classify_task_type(stimulus_description: str) -> dict[str, str]:
@@ -958,6 +1335,22 @@ def _persona_seed_corpus(seed: dict[str, Any]) -> str:
     return " ".join([part for part in parts if part]).strip()
 
 
+def _persona_seed_price_profile(seed: dict[str, Any]) -> str:
+    budget = _safe_str(seed.get("budget_sensitivity"), "").lower()
+    if budget == "low":
+        return "premium"
+    if budget == "high":
+        return "value"
+
+    corpus = _persona_seed_corpus(seed).lower()
+    if _contains_any_hint(corpus, PREMIUM_AUDIENCE_HINTS):
+        return "premium"
+    if _contains_any_hint(corpus, VALUE_AUDIENCE_HINTS):
+        return "value"
+
+    return "mixed"
+
+
 def _token_overlap_score(query: set[str], doc: set[str]) -> float:
     if not query or not doc:
         return 0.0
@@ -976,6 +1369,7 @@ def _select_persona_seeds_for_audience(
 
     audience_tokens = _query_tokens(target_audience)
     stimulus_tokens = _query_tokens(stimulus_description)
+    audience_profile = _audience_price_profile(target_audience)
 
     scored: list[dict[str, Any]] = []
     for seed in seed_pool:
@@ -984,7 +1378,17 @@ def _select_persona_seeds_for_audience(
             continue
         audience_score = _token_overlap_score(audience_tokens, corpus_tokens)
         stimulus_score = _token_overlap_score(stimulus_tokens, corpus_tokens)
-        base_score = (0.7 * audience_score) + (0.3 * stimulus_score) + random.random() * 0.01
+        seed_profile = _persona_seed_price_profile(seed)
+        price_alignment = 0.0
+        if audience_profile != "mixed" and seed_profile != "mixed":
+            price_alignment = 0.12 if audience_profile == seed_profile else -0.08
+
+        base_score = (
+            (0.7 * audience_score)
+            + (0.3 * stimulus_score)
+            + price_alignment
+            + random.random() * 0.01
+        )
         scored.append({"score": base_score, "seed": seed})
 
     if not scored:
@@ -1365,11 +1769,43 @@ def _normalize_blueprint_entry(payload: dict[str, Any], index: int) -> dict[str,
     }
 
 
+def _apply_market_fit_guidance_to_blueprints(
+    blueprints: list[dict[str, Any]],
+    market_fit_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not blueprints:
+        return blueprints
+
+    fit_signal = _safe_str(market_fit_context.get("fit_signal"), "neutral")
+    if fit_signal != "mismatch":
+        return blueprints
+
+    adjusted = [dict(entry) for entry in blueprints]
+    skeptical_target = max(1, math.ceil(len(adjusted) * 0.67))
+
+    for idx, entry in enumerate(adjusted):
+        if idx < skeptical_target:
+            entry["stance"] = "skeptic" if idx % 2 == 0 else "fence-sitter"
+
+        must_include = _normalize_string_list(entry.get("must_include"), [])
+        additions = [
+            "one concrete reason the pricing/brand positioning may feel off for this audience",
+            "one specific condition that could change your mind",
+        ]
+        for note in additions:
+            if note not in must_include:
+                must_include.append(note)
+        entry["must_include"] = must_include[:5]
+
+    return adjusted
+
+
 async def _build_diversity_blueprints(
     target_audience: str,
     stimulus_description: str,
     task_type: str,
     persona_count: int,
+    market_fit_context: dict[str, Any],
 ) -> list[dict[str, Any]]:
     system_prompt = (
         "You are designing a synthetic focus group panel. Create highly diverse personas with "
@@ -1385,6 +1821,12 @@ Stimulus:
 
 Task type:
 {task_type}
+
+Market fit context:
+- fit_signal: {_safe_str(market_fit_context.get("fit_signal"), "neutral")}
+- audience_price_profile: {_safe_str(market_fit_context.get("audience_price_profile"), "mixed")}
+- stimulus_price_position: {_safe_str(market_fit_context.get("stimulus_price_position"), "neutral")}
+- rationale: {_safe_str(market_fit_context.get("rationale"), "")}
 
 Create exactly {persona_count} panel_blueprints with maximum diversity.
 Avoid repeating occupations or near-identical names.
@@ -1408,6 +1850,8 @@ Rules:
 - Persona details must feel plausible for the stimulus category.
 - Avoid fabricated objective claims (health, legal, safety, scientific) unless directly supported.
 - Do NOT force any sentiment distribution. Let sentiment emerge organically from persona context.
+- If market fit is mismatch, include more skepticism and concrete status/value tradeoff concerns.
+- Avoid defaulting to polite neutral responses for subjective concept prompts.
 """
 
     raw_panel: list[dict[str, Any]] = []
@@ -1471,13 +1915,14 @@ Rules:
                 per_persona_count,
             )
 
-    return normalized
+    return _apply_market_fit_guidance_to_blueprints(normalized, market_fit_context)
 
 
 def _default_persona(
     index: int,
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
+    task_type: str,
 ) -> dict[str, Any]:
     dimension_specs = analysis_dimensions or _fallback_dimension_specs()
     cognitive_load: dict[str, int] = {}
@@ -1492,6 +1937,12 @@ def _default_persona(
         blueprint.get("daily_context"),
         _safe_str(blueprint.get("driving_context"), "weekday routine with competing demands"),
     )
+    stance = _safe_str(blueprint.get("stance"), "fence-sitter")
+    default_subjective_score = {
+        "champion": 0.28,
+        "skeptic": -0.28,
+        "fence-sitter": -0.12,
+    }.get(stance, -0.12)
 
     return {
         "name": _safe_str(blueprint.get("name"), f"Persona {index + 1}"),
@@ -1510,11 +1961,14 @@ def _default_persona(
         "daily_context": daily_context,
         "driving_context": daily_context,
         "budget_sensitivity": _safe_str(blueprint.get("budget_sensitivity"), "medium"),
-        "stance": _safe_str(blueprint.get("stance"), "fence-sitter"),
+        "stance": stance,
         "sentiment_target": "organic",
         "stress_level": 65,
-        "sentiment_score": 0.0,
-        "sentiment_label": "neutral",
+        "sentiment_score": 0.0 if task_type == "Objective UI Task" else default_subjective_score,
+        "sentiment_label": "neutral" if task_type == "Objective UI Task" else _sentiment_label_from_score(default_subjective_score),
+        "sentiment_intensity": "truly_neutral"
+        if task_type == "Objective UI Task"
+        else _sentiment_intensity_from_score(default_subjective_score),
         "cognitive_load": cognitive_load,
         "reaction_summary": "I evaluate this based on real-world fit, trust, and practical tradeoffs.",
         "quote": "If this helps in my actual routine, I can get behind it.",
@@ -1542,8 +1996,10 @@ def _normalize_persona(
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
     stimulus_description: str,
+    task_type: str,
+    market_fit_context: dict[str, Any],
 ) -> dict[str, Any]:
-    default_persona = _default_persona(index, blueprint, analysis_dimensions)
+    default_persona = _default_persona(index, blueprint, analysis_dimensions, task_type)
     dimension_specs = analysis_dimensions or _fallback_dimension_specs()
 
     cognitive_load_raw = payload.get("cognitive_load")
@@ -1564,22 +2020,38 @@ def _normalize_persona(
             key_index=key_index,
         )
 
+    stance = _safe_str(
+        payload.get("stance"), _safe_str(default_persona["stance"], "fence-sitter")
+    ).lower()
+    if stance not in {"champion", "fence-sitter", "skeptic"}:
+        stance = "fence-sitter"
+
     sentiment_score = _safe_float(
         payload.get("sentiment_score"),
-        _safe_float(default_persona.get("sentiment_score"), 0.0),
+        _safe_float(default_persona.get("sentiment_score"), -0.12),
     )
 
-    sentiment_label = _safe_str(
-        payload.get("sentiment_label"),
-        _safe_str(default_persona.get("sentiment_label"), "neutral"),
-    ).lower()
-    if sentiment_label not in {"positive", "neutral", "negative"}:
-        if sentiment_score > 0.15:
-            sentiment_label = "positive"
-        elif sentiment_score < -0.15:
-            sentiment_label = "negative"
-        else:
-            sentiment_label = "neutral"
+    if task_type == "Objective UI Task":
+        sentiment_score = 0.0
+    else:
+        fit_signal = _safe_str(market_fit_context.get("fit_signal"), "neutral")
+        sentiment_bias = _safe_float(market_fit_context.get("sentiment_bias"), 0.0, -0.8, 0.3)
+        sentiment_score = _safe_float(sentiment_score + sentiment_bias, sentiment_score, -1.0, 1.0)
+
+        if fit_signal == "mismatch":
+            sentiment_score = min(sentiment_score, 0.04)
+
+        persona_name_hint = _safe_str(
+            payload.get("name"),
+            _safe_str(default_persona.get("name"), f"Persona {index + 1}"),
+        )
+        sentiment_score = _enforce_subjective_directionality(
+            sentiment_score=sentiment_score,
+            stance=stance,
+            market_fit_context=market_fit_context,
+            index=index,
+            persona_name=persona_name_hint,
+        )
 
     daily_context = _safe_str(
         payload.get("daily_context"),
@@ -1627,9 +2099,7 @@ def _normalize_persona(
             payload.get("budget_sensitivity"),
             _safe_str(default_persona["budget_sensitivity"], "medium"),
         ).lower(),
-        "stance": _safe_str(
-            payload.get("stance"), _safe_str(default_persona["stance"], "fence-sitter")
-        ),
+        "stance": stance,
         "sentiment_target": _safe_str(
             payload.get("sentiment_target"),
             _safe_str(default_persona.get("sentiment_target"), "organic"),
@@ -1638,7 +2108,8 @@ def _normalize_persona(
             payload.get("stress_level"), _safe_int(default_persona["stress_level"], 65)
         ),
         "sentiment_score": sentiment_score,
-        "sentiment_label": sentiment_label,
+        "sentiment_label": _sentiment_label_from_score(sentiment_score),
+        "sentiment_intensity": _sentiment_intensity_from_score(sentiment_score),
         "cognitive_load": cognitive_load,
         "reaction_summary": _safe_str(
             payload.get("reaction_summary"),
@@ -1663,6 +2134,18 @@ def _normalize_persona(
         ),
     }
 
+    if task_type != "Objective UI Task":
+        rescored = _rescore_subjective_sentiment(
+            base_score=sentiment_score,
+            profile=normalized,
+            stance=stance,
+            market_fit_context=market_fit_context,
+            index=index,
+        )
+        normalized["sentiment_score"] = rescored
+        normalized["sentiment_label"] = _sentiment_label_from_score(rescored)
+        normalized["sentiment_intensity"] = _sentiment_intensity_from_score(rescored)
+
     return _sanitize_persona_claims(normalized, stimulus_description)
 
 
@@ -1671,6 +2154,7 @@ def _persona_seed_prompt(
     stimulus_description: str,
     image_url: str | None,
     task_type: str,
+    market_fit_context: dict[str, Any],
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
     index: int,
@@ -1717,6 +2201,10 @@ Target audience: {target_audience}
 Stimulus: {stimulus_description}
 Stimulus image URL (optional context): {image_url or "none"}
 Task type: {task_type}
+Market fit signal: {_safe_str(market_fit_context.get("fit_signal"), "neutral")}
+Market fit rationale: {_safe_str(market_fit_context.get("rationale"), "")}
+Audience price profile: {_safe_str(market_fit_context.get("audience_price_profile"), "mixed")}
+Stimulus price position: {_safe_str(market_fit_context.get("stimulus_price_position"), "neutral")}
 
 Persona blueprint (must follow):
 - name: {blueprint.get("name")}
@@ -1757,6 +2245,7 @@ Return exactly one JSON object with keys:
 - stress_level (integer 0-100)
 - sentiment_score (number from -1 to 1)
 - sentiment_label ("positive"|"neutral"|"negative")
+- sentiment_intensity ("firmly_positive"|"leaning_positive"|"truly_neutral"|"leaning_negative"|"firmly_negative")
 - cognitive_load (object with integers 0-100):
 {dimension_keys}
 - reaction_summary (string)
@@ -1768,9 +2257,12 @@ Return exactly one JSON object with keys:
 Rules:
 - Keep this persona distinct from generic answers.
 - Sentiment must emerge organically from memory stream + stimulus, do not force distribution.
+- For subjective concept tasks, avoid defaulting to neutral. Use a directional leaning unless truly undecided.
+- If sentiment is neutral, it must be genuinely conflicted and explicitly explain what is unresolved.
 - Mention at least one concrete concern and one potential upside.
 - Do not invent objective claims (health/safety/legal/scientific) unless clearly supported by the stimulus.
 - If the stimulus is fast food or indulgent food, do not call it healthy.
+- If market fit is mismatch, skepticism is expected unless you provide specific counterevidence.
 - {task_type_guidance}
 """
     return system_prompt, user_prompt
@@ -1781,6 +2273,7 @@ async def _generate_one_persona(
     stimulus_description: str,
     image_url: str | None,
     task_type: str,
+    market_fit_context: dict[str, Any],
     persona_count: int,
     blueprint: dict[str, Any],
     analysis_dimensions: list[dict[str, str]],
@@ -1793,19 +2286,22 @@ async def _generate_one_persona(
             stimulus_description=stimulus_description,
             image_url=image_url,
             task_type=task_type,
+            market_fit_context=market_fit_context,
             blueprint=blueprint,
             analysis_dimensions=analysis_dimensions,
             index=index,
             total=persona_count,
         )
 
-        raw = await _chat_json(system_prompt, user_prompt, temperature=0.9)
+        raw = await _chat_json(system_prompt, user_prompt, temperature=0.75)
         normalized = _normalize_persona(
             raw,
             index,
             blueprint,
             analysis_dimensions,
             stimulus_description,
+            task_type,
+            market_fit_context,
         )
 
         agent_id = f"agent_{uuid.uuid4().hex[:10]}"
@@ -1839,14 +2335,34 @@ async def _generate_one_persona(
 def _build_manager_summary(
     personas: list[PersonaState],
     analysis_dimensions: list[dict[str, str]],
+    task_type: str,
 ) -> dict[str, Any]:
     dimension_specs = analysis_dimensions or _fallback_dimension_specs()
     dimension_keys = _dimension_keys(dimension_specs)
 
     if not personas:
+        empty_sentiment = (
+            {
+                "overall": "not_applicable",
+                "breakdown": {
+                    "positive": 0,
+                    "neutral": 0,
+                    "negative": 0,
+                    "average_score": 0.0,
+                    "score_spread": 0.0,
+                },
+                "raw": {
+                    "applicability": "not_applicable",
+                    "reason": "Task type is objective UI analysis, not preference sentiment.",
+                    "task_type": task_type,
+                },
+            }
+            if task_type == "Objective UI Task"
+            else {"overall": "neutral", "breakdown": {}, "raw": {}}
+        )
         return {
             "cognitive_load_heatmap": {},
-            "sentiment": {"overall": "neutral", "breakdown": {}, "raw": {}},
+            "sentiment": empty_sentiment,
             "demographics": [],
             "analysis_dimensions": dimension_specs,
         }
@@ -1877,9 +2393,9 @@ def _build_manager_summary(
     avg_sentiment = round(sum(sentiment_scores) / max(1, len(sentiment_scores)), 3)
     score_spread = round(pstdev(sentiment_scores), 3) if len(sentiment_scores) > 1 else 0.0
 
-    if avg_sentiment >= 0.2:
+    if avg_sentiment >= 0.1:
         overall_sentiment = "positive"
-    elif avg_sentiment <= -0.2:
+    elif avg_sentiment <= -0.1:
         overall_sentiment = "negative"
     else:
         overall_sentiment = "neutral"
@@ -1927,9 +2443,24 @@ def _build_manager_summary(
         },
     ]
 
-    return {
-        "cognitive_load_heatmap": cognitive_load_heatmap,
-        "sentiment": {
+    if task_type == "Objective UI Task":
+        sentiment_payload = {
+            "overall": "not_applicable",
+            "breakdown": {
+                "positive": 0,
+                "neutral": 0,
+                "negative": 0,
+                "average_score": 0.0,
+                "score_spread": 0.0,
+            },
+            "raw": {
+                "applicability": "not_applicable",
+                "reason": "Task type is objective UI analysis, not preference sentiment.",
+                "task_type": task_type,
+            },
+        }
+    else:
+        sentiment_payload = {
             "overall": overall_sentiment,
             "breakdown": {
                 "positive": sentiment_counter.get("positive", 0),
@@ -1943,8 +2474,13 @@ def _build_manager_summary(
                 "score_spread": score_spread,
                 "counts": dict(sentiment_counter),
                 "stance_mix": dict(stance_counter),
+                "task_type": task_type,
             },
-        },
+        }
+
+    return {
+        "cognitive_load_heatmap": cognitive_load_heatmap,
+        "sentiment": sentiment_payload,
         "demographics": demographics,
         "analysis_dimensions": dimension_specs,
     }
@@ -2041,10 +2577,15 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
     )
     task_type_info = await _classify_task_type(request.stimulus_description)
     task_type = _safe_str(task_type_info.get("task_type"), "Subjective Concept")
+    market_fit_context = _build_market_fit_context(
+        target_audience=audience_info["target_audience"],
+        stimulus_description=request.stimulus_description,
+        task_type=task_type,
+    )
 
     resolved_target_audience = audience_info["target_audience"]
     analysis_dimensions = await _resolve_analysis_dimensions(
-        requested_dimensions=request.analysis_dimensions,
+        requested_dimensions=None,
         target_audience=resolved_target_audience,
         stimulus_description=request.stimulus_description,
     )
@@ -2054,6 +2595,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
         stimulus_description=request.stimulus_description,
         task_type=task_type,
         persona_count=request.persona_count,
+        market_fit_context=market_fit_context,
     )
 
     semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
@@ -2063,6 +2605,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
             stimulus_description=request.stimulus_description,
             image_url=request.image_url,
             task_type=task_type,
+            market_fit_context=market_fit_context,
             persona_count=request.persona_count,
             blueprint=blueprints[index],
             analysis_dimensions=analysis_dimensions,
@@ -2081,7 +2624,12 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
         if isinstance(result, Exception):
             failures.append(f"persona_{idx + 1}: {result}")
             fallback_blueprint = blueprints[idx] if idx < len(blueprints) else {}
-            fallback_profile = _default_persona(idx, fallback_blueprint, analysis_dimensions)
+            fallback_profile = _default_persona(
+                idx,
+                fallback_blueprint,
+                analysis_dimensions,
+                task_type,
+            )
             fallback_agent_id = f"agent_{uuid.uuid4().hex[:10]}"
 
             fallback_state = PersonaState(
@@ -2105,7 +2653,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
 
     await store.upsert_many(personas)
 
-    manager_summary = _build_manager_summary(personas, analysis_dimensions)
+    manager_summary = _build_manager_summary(personas, analysis_dimensions, task_type)
 
     persona_payloads = [
         {
@@ -2127,6 +2675,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
         "image_url": request.image_url,
         "task_type": task_type,
         "task_type_rationale": _safe_str(task_type_info.get("task_type_rationale"), ""),
+        "market_fit_context": market_fit_context,
         "analysis_dimensions": analysis_dimensions,
         "manager_summary": manager_summary,
         "personas": persona_payloads,
@@ -2137,6 +2686,39 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
 @app.post("/synthetic/followup")
 async def ask_persona_followup(request: FollowupRequest) -> dict[str, Any]:
     persona = await store.get(request.agent_id)
+    if persona is None and isinstance(request.persona_profile, dict):
+        profile = dict(request.persona_profile)
+        profile["agent_id"] = request.agent_id
+        profile["stimulus_description"] = _safe_str(profile.get("stimulus_description"), "")
+        profile["task_type"] = _safe_str(profile.get("task_type"), "Subjective Concept")
+
+        bootstrap_texts = [
+            f"Persona type: {_safe_str(profile.get('persona_type'), '')}",
+            f"Daily context: {_safe_str(profile.get('daily_context'), _safe_str(profile.get('driving_context'), ''))}",
+            _safe_str(profile.get("reaction_summary"), ""),
+            _safe_str(profile.get("quote"), ""),
+            "Reasons: " + "; ".join(_normalize_string_list(profile.get("reasons"), [])),
+            "Concerns: " + "; ".join(_normalize_string_list(profile.get("concerns"), [])),
+            "Delights: " + "; ".join(_normalize_string_list(profile.get("delights"), [])),
+            "Memory stream: " + " | ".join(_normalize_string_list(profile.get("memory_stream"), [])),
+        ]
+        bootstrap_chunks = [
+            MemoryChunk(text=text, kind="seed")
+            for text in bootstrap_texts
+            if _safe_str(text, "")
+        ]
+
+        embeddings = await asyncio.gather(*[_embed_text(chunk.text) for chunk in bootstrap_chunks])
+        for chunk, embedding in zip(bootstrap_chunks, embeddings):
+            chunk.embedding = embedding
+
+        persona = PersonaState(
+            agent_id=request.agent_id,
+            profile=profile,
+            memories=bootstrap_chunks,
+        )
+        await store.upsert_many([persona])
+
     if persona is None:
         raise HTTPException(
             status_code=404,

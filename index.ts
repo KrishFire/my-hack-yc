@@ -810,11 +810,10 @@ function makeFallbackSimulationProps(
   targetAudience: string | undefined,
   stimulusDescription: string,
   imageUrl: string | undefined,
-  analysisDimensions: string[] | undefined,
   errorMessage: string,
   raw: unknown
 ): FocusGroupWidgetProps {
-  const normalizedDimensions = normalizeAnalysisDimensions(analysisDimensions ?? []);
+  const normalizedDimensions: AnalysisDimension[] = [];
   return {
     target_audience: targetAudience?.trim() ? targetAudience : "Audience unavailable",
     target_audience_generated: false,
@@ -864,12 +863,6 @@ server.tool(
         .max(1000)
         .optional()
         .describe("Optional number of personas to simulate (3-1000)"),
-      analysis_dimensions: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "Optional custom evaluation dimensions. If omitted, backend auto-generates dimensions from stimulus."
-        ),
     }),
     widget: {
       name: "focus-group-results",
@@ -884,7 +877,6 @@ server.tool(
     stimulus_description,
     image_url,
     persona_count,
-    analysis_dimensions,
   }) => {
     const requestPayload: Record<string, unknown> = {
       stimulus_description,
@@ -900,15 +892,6 @@ server.tool(
 
     if (typeof persona_count === "number") {
       requestPayload.persona_count = persona_count;
-    }
-
-    if (Array.isArray(analysis_dimensions)) {
-      const cleaned = analysis_dimensions
-        .map((dimension) => dimension.trim())
-        .filter((dimension) => dimension.length > 0);
-      if (cleaned.length > 0) {
-        requestPayload.analysis_dimensions = cleaned;
-      }
     }
 
     try {
@@ -953,7 +936,6 @@ server.tool(
           target_audience,
           stimulus_description,
           image_url,
-          analysis_dimensions,
           message,
           raw
         ),
@@ -971,6 +953,10 @@ server.tool(
     schema: z.object({
       agent_id: z.string().describe("ID of the synthetic persona to query"),
       question: z.string().describe("Follow-up question for the selected persona"),
+      persona_profile: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe("Optional persona snapshot used if backend store was reset"),
     }),
     outputSchema: z.object({
       agent_id: z.string(),
@@ -981,12 +967,16 @@ server.tool(
       error: z.string().optional(),
     }),
   },
-  async ({ agent_id, question }) => {
+  async ({ agent_id, question, persona_profile }) => {
     try {
-      const followupResponse = await postJson("/synthetic/followup", {
+      const payload: Record<string, unknown> = {
         agent_id,
         question,
-      });
+      };
+      if (persona_profile) {
+        payload.persona_profile = persona_profile;
+      }
+      const followupResponse = await postJson("/synthetic/followup", payload);
 
       return object(normalizeFollowupResponse(followupResponse, agent_id, question));
     } catch (error) {

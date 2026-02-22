@@ -61,7 +61,6 @@ type RunToolInput = {
   target_audience?: string;
   stimulus_description: string;
   image_url?: string;
-  analysis_dimensions?: string[];
 };
 
 type FollowupBatchItem = {
@@ -287,8 +286,9 @@ function getPersonaRole(persona: Record<string, unknown>): string | null {
   );
 }
 
-function getPersonaStress(persona: Record<string, unknown>): number {
-  return clampPercent(toNumber(pickFirst(persona, ["stress_level", "stressLevel"]), 0));
+function getPersonaPreference(persona: Record<string, unknown>): number {
+  const score = toNumber(pickFirst(persona, ["sentiment_score", "sentimentScore"]), 0);
+  return clampPercent(((score + 1) / 2) * 100);
 }
 
 function getPersonaSegmentValue(
@@ -394,7 +394,11 @@ const FocusGroupResults: React.FC = () => {
     callToolAsync: callAskPersonaFollowup,
     isPending: isFollowupPending,
   } = useCallTool<
-    { agent_id: string; question: string },
+    {
+      agent_id: string;
+      question: string;
+      persona_profile?: Record<string, unknown>;
+    },
     { structuredContent?: FollowupStructuredContent }
   >("ask_persona_followup");
 
@@ -538,12 +542,16 @@ const FocusGroupResults: React.FC = () => {
       : []
   );
 
-  const averageStress = personas.length
+  const averagePreference = personas.length
     ? Math.round(
-        personas.reduce((sum, persona) => sum + getPersonaStress(persona), 0) /
+        personas.reduce((sum, persona) => sum + getPersonaPreference(persona), 0) /
           personas.length
       )
     : 0;
+
+  const sentimentOverallRaw = displayProps.manager_summary?.sentiment?.overall;
+  const sentimentApplicable =
+    String(sentimentOverallRaw ?? "").toLowerCase() !== "not_applicable";
 
   const simulationError = displayProps.error;
 
@@ -639,6 +647,7 @@ const FocusGroupResults: React.FC = () => {
           const result = await callAskPersonaFollowup({
             agent_id: persona.agent_id,
             question: trimmedQuestion,
+            persona_profile: persona,
           });
 
           const structured = result.structuredContent;
@@ -774,8 +783,8 @@ const FocusGroupResults: React.FC = () => {
                 <p className="mt-1 text-xl font-semibold text-default">{personas.length}</p>
               </div>
               <div className="rounded-2xl border border-default bg-white/70 p-3 text-center shadow-sm">
-                <p className="text-[11px] uppercase tracking-wide text-secondary">Avg Stress</p>
-                <p className="mt-1 text-xl font-semibold text-default">{averageStress}</p>
+                <p className="text-[11px] uppercase tracking-wide text-secondary">Avg Preference</p>
+                <p className="mt-1 text-xl font-semibold text-default">{averagePreference}</p>
               </div>
               <div className="rounded-2xl border border-default bg-white/70 p-3 text-center shadow-sm">
                 <p className="text-[11px] uppercase tracking-wide text-secondary">Sentiment</p>
@@ -875,44 +884,51 @@ const FocusGroupResults: React.FC = () => {
           <div className="opacity-55">
             <div className="rounded-2xl border border-default/70 bg-white/60 p-4 shadow-sm space-y-3">
               <p className="text-[10px] uppercase tracking-[0.16em] text-secondary">Sentiment Mix</p>
+              {sentimentApplicable ? (
+                <div className="rounded-xl border border-default/80 bg-surface p-3 space-y-2">
+                  <div className="h-3 rounded-full overflow-hidden bg-default/10 flex">
+                    <div
+                      className="h-full bg-emerald-500"
+                      style={{
+                        width: `${(sentimentStats.positive / totalSentimentVotes) * 100}%`,
+                      }}
+                    />
+                    <div
+                      className="h-full bg-amber-400"
+                      style={{
+                        width: `${(sentimentStats.neutral / totalSentimentVotes) * 100}%`,
+                      }}
+                    />
+                    <div
+                      className="h-full bg-rose-500"
+                      style={{
+                        width: `${(sentimentStats.negative / totalSentimentVotes) * 100}%`,
+                      }}
+                    />
+                  </div>
 
-              <div className="rounded-xl border border-default/80 bg-surface p-3 space-y-2">
-                <div className="h-3 rounded-full overflow-hidden bg-default/10 flex">
-                  <div
-                    className="h-full bg-emerald-500"
-                    style={{
-                      width: `${(sentimentStats.positive / totalSentimentVotes) * 100}%`,
-                    }}
-                  />
-                  <div
-                    className="h-full bg-amber-400"
-                    style={{
-                      width: `${(sentimentStats.neutral / totalSentimentVotes) * 100}%`,
-                    }}
-                  />
-                  <div
-                    className="h-full bg-rose-500"
-                    style={{
-                      width: `${(sentimentStats.negative / totalSentimentVotes) * 100}%`,
-                    }}
-                  />
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 text-xs">
-                  <div className="rounded-lg border border-default/70 px-2 py-1 bg-emerald-500/10">
-                    <p className="text-secondary">Positive</p>
-                    <p className="text-default font-semibold">{sentimentStats.positive}</p>
-                  </div>
-                  <div className="rounded-lg border border-default/70 px-2 py-1 bg-amber-400/10">
-                    <p className="text-secondary">Neutral</p>
-                    <p className="text-default font-semibold">{sentimentStats.neutral}</p>
-                  </div>
-                  <div className="rounded-lg border border-default/70 px-2 py-1 bg-rose-500/10">
-                    <p className="text-secondary">Negative</p>
-                    <p className="text-default font-semibold">{sentimentStats.negative}</p>
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div className="rounded-lg border border-default/70 px-2 py-1 bg-emerald-500/10">
+                      <p className="text-secondary">Positive</p>
+                      <p className="text-default font-semibold">{sentimentStats.positive}</p>
+                    </div>
+                    <div className="rounded-lg border border-default/70 px-2 py-1 bg-amber-400/10">
+                      <p className="text-secondary">Neutral</p>
+                      <p className="text-default font-semibold">{sentimentStats.neutral}</p>
+                    </div>
+                    <div className="rounded-lg border border-default/70 px-2 py-1 bg-rose-500/10">
+                      <p className="text-secondary">Negative</p>
+                      <p className="text-default font-semibold">{sentimentStats.negative}</p>
+                    </div>
                   </div>
                 </div>
-              </div>
+              ) : (
+                <div className="rounded-xl border border-default/80 bg-surface p-3">
+                  <p className="text-xs text-secondary">
+                    Sentiment is not applicable for objective UI tasks.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
 
@@ -972,7 +988,7 @@ const FocusGroupResults: React.FC = () => {
                 const isActive = persona.agent_id === activeAgentId;
                 const sentiment = getPersonaSentiment(persona);
                 const role = getPersonaRole(persona);
-                const stress = getPersonaStress(persona);
+                const preference = getPersonaPreference(persona);
                 const quote =
                   asString(pickFirst(persona, ["quote", "reaction_summary", "summary"])) ??
                   "No quote available.";
@@ -1009,13 +1025,13 @@ const FocusGroupResults: React.FC = () => {
 
                     <div className="mt-2 space-y-1">
                       <div className="flex items-center justify-between text-[11px] text-secondary">
-                        <span>Stress level</span>
-                        <span>{Math.round(stress)}</span>
+                        <span>Preference</span>
+                        <span>{Math.round(preference)}</span>
                       </div>
                       <div className="h-1.5 rounded-full bg-white/70 overflow-hidden">
                         <div
                           className="h-full rounded-full bg-gradient-to-r from-[#2f7ab6] to-[#f3924f]"
-                          style={{ width: `${clampPercent(stress)}%` }}
+                          style={{ width: `${clampPercent(preference)}%` }}
                         />
                       </div>
                     </div>
