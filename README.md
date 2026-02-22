@@ -1,27 +1,48 @@
-# MCP Apps Hackathon @ YC by Manufact
+# Synthetic Focus Group MCP App
 
-![MCP Apps Hackathon](https://d2xtzufx9mvgbo.cloudfront.net/events/Screenshot%202026-02-05%20at%205.39.36%E2%80%AFPM-4352f7d27bd84e6f.png)
+An interactive MCP app for running fast, grounded synthetic focus groups on ads, product concepts, and UI experiences.
 
+Built for the Manufact MCP Apps Hackathon at YC.
 
-A hackathon starter built with [mcp-use](https://mcp-use.com) and deployed on [Manufact Cloud](https://manufact.com). Part of the [MCP Apps Hackathon by Manufact](https://events.ycombinator.com/manufact-hackathon26) at Y Combinator.
+## Why This Is Useful
+- Product teams can test messaging before launch.
+- Designers can pressure-test ideas with realistic audience segments.
+- Researchers can ask follow-up questions to specific personas or entire subgroups, directly inside the widget.
 
-## Getting Started
+## What We Built
+- Two MCP tools:
+  - `run_synthetic_focus_group`
+  - `ask_persona_followup`
+- A custom React widget (`focus-group-results`) that renders:
+  - simulation summary
+  - persona roster
+  - in-widget rerun controls
+  - single or batch follow-up chat
+- A FastAPI backend that:
+  - classifies task type (`Objective UI Task` vs `Subjective Concept`)
+  - grounds personas with `SynthlabsAI/PERSONA` from Hugging Face
+  - applies sentiment/preference calibration based on actual persona language
+  - supports image grounding for visible brand/price cues
 
-Install dependencies and start the dev server:
+## How It Works
+1. User asks host (Claude/ChatGPT/Inspector) to run a focus group.
+2. MCP tool calls backend `POST /synthetic/simulate`.
+3. Backend returns manager summary + personas.
+4. MCP server returns widget-linked result.
+5. Widget lets the user:
+   - edit target audience / stimulus / image and rerun
+   - ask follow-ups to selected personas, all personas, or segments
 
-```bash
-npm install
-npm run dev
-```
+## MCP Tools
 
-Open [http://localhost:3000/inspector](http://localhost:3000/inspector) to test your server interactively — no external tunneling needed.
+| Tool | Input | Output |
+|---|---|---|
+| `run_synthetic_focus_group` | `target_audience?`, `stimulus_description`, `image_url?`, `persona_count?` | Widget props (`manager_summary`, `personas`, metadata) |
+| `ask_persona_followup` | `agent_id`, `question`, `persona_profile?` | Structured answer + supporting memory snippets |
 
-You can start building by editing `index.ts`. Add tools, resources, and prompts — the server auto-reloads as you edit thanks to Hot Module Reloading (HMR).
+## Quickstart (Local)
 
-## Local Focus Group Backend (Required for this app)
-
-This MCP app expects a local FastAPI service at `http://127.0.0.1:8000`.
-
+### 1) Start backend (Terminal A)
 ```bash
 cd backend
 python3 -m venv .venv
@@ -31,84 +52,32 @@ export OPENAI_API_KEY="<your-key>"
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Then run the MCP app from repo root:
-
+### 2) Start MCP server + widget (Terminal B)
 ```bash
+npm install
 npm run dev
 ```
 
-## Connecting to Claude or ChatGPT
+Inspector:
+- `http://localhost:3000/inspector`
 
-### Local testing with tunnel
+Health check:
+```bash
+curl http://127.0.0.1:8000/health
+```
 
-Start the dev server with a built-in tunnel to get a public HTTPS URL instantly — no deployment needed:
+## Run in Claude / ChatGPT
 
+Start with tunnel:
 ```bash
 npm run dev -- --tunnel
 ```
 
-The CLI prints a stable public URL like `https://<subdomain>.tunnel.mcp-use.com/mcp`. Add it as a remote MCP server:
+Use the printed URL (example):
+- `https://<subdomain>.tunnel.mcp-use.com/mcp`
 
-- **Claude**: Settings → **Integrations** → **Add integration** → paste the tunnel URL
-- **ChatGPT**: Settings → **Connectors** → **Add MCP server** → paste the tunnel URL
-
-The tunnel keeps the same subdomain across restarts, so your link stays stable while you iterate.
-
-### After deployment
-
-Once deployed to Manufact Cloud, add your production URL as a remote MCP server:
-
+Then add that MCP URL:
+- Claude: Settings → Integrations → Add integration
+- ChatGPT: Settings → Connectors → Add MCP server
+// End of Selection
 ```
-https://<your-slug>.run.mcp-use.com/mcp
-```
-
-## Alternative: Goose (no Claude Pro or ChatGPT Plus required)
-
-If you don't have a Claude Pro or ChatGPT Plus account, you can use [Goose](https://block.github.io/goose/docs/quickstart/) 
-
-Follow the [Goose quickstart](https://block.github.io/goose/docs/quickstart/) to install it, then add your tunnel or deployed URL as an MCP extension.
-
-## Deploy
-
-### Manufact Cloud Dashboard
-
-1. Sign in at [manufact.com](https://manufact.com)
-2. Go to **Servers** → **New Server**
-3. Connect your GitHub repository
-4. Click **Deploy** 
-
-Your server will be live at `https://<your-slug>.run.mcp-use.com/mcp` and manageable from the [dashboard](https://manufact.com/cloud/servers).
-
-### CLI
-
-```bash
-# Login to Manufact Cloud
-npx @mcp-use/cli login
-
-# Deploy from your repo root
-npm run deploy
-```
-
-The CLI detects your GitHub repository, builds the project, and streams logs until deployment completes:
-
-```
-✓ Deployment successful!
-
-🌐 MCP Server URL:
-   https://<your-slug>.run.mcp-use.com/mcp
-
-📊 Dashboard:
-   https://manufact.com/cloud/servers/<your-slug>
-```
-
-Subsequent `npm run deploy` calls redeploy to the same URL 
-
-## Resources
-
-- [mcp-use Documentation](https://mcp-use.com/docs/typescript/getting-started/quickstart) — guides, API reference, and tutorials
-- [CLI Reference](https://mcp-use.com/docs/typescript/server/cli-reference) — full `mcp-use` CLI docs
-- [Manufact Cloud Deployment](https://mcp-use.com/docs/typescript/server/deployment/mcp-use) — deployment guide
-- [MCP Apps / UI Widgets](https://mcp-use.com/docs/typescript/server/mcp-apps) — build interactive widgets in Claude and ChatGPT
-- [Model Context Protocol](https://modelcontextprotocol.io/) — the open standard powering MCP servers
-- [Goose](https://block.github.io/goose/docs/quickstart/) — free open-source MCP client
-- [MCP Apps Hackathon](https://events.ycombinator.com/manufact-hackathon26) — event page
