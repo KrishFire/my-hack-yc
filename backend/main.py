@@ -34,6 +34,7 @@ else:
 APP_NAME = "synthetic-focus-group-backend"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
 OPENAI_MODEL_FALLBACKS = [
     model.strip()
     for model in os.getenv("OPENAI_MODEL_FALLBACKS", "gpt-5-mini,gpt-4o-mini").split(",")
@@ -44,12 +45,14 @@ MAX_PERSONA_COUNT = int(os.getenv("FG_MAX_PERSONA_COUNT", "1000"))
 MAX_PARALLEL_TASKS = int(os.getenv("FG_MAX_PARALLEL_TASKS", "8"))
 TOP_K_MEMORIES = int(os.getenv("FG_TOP_K_MEMORIES", "5"))
 MAX_PERSONA_STORE = int(os.getenv("FG_MAX_PERSONA_STORE", "5000"))
-HF_MEMORY_DATASET = os.getenv("FG_HF_MEMORY_DATASET", "yahoo_answers_topics")
-HF_MEMORY_POOL_MIN = int(os.getenv("FG_HF_MEMORY_POOL_MIN", "10"))
-HF_MEMORY_POOL_MAX = int(os.getenv("FG_HF_MEMORY_POOL_MAX", "15"))
 HF_MEMORY_PER_PERSONA_MIN = int(os.getenv("FG_HF_MEMORY_PER_PERSONA_MIN", "2"))
 HF_MEMORY_PER_PERSONA_MAX = int(os.getenv("FG_HF_MEMORY_PER_PERSONA_MAX", "3"))
-HF_MEMORY_CACHE_TTL_SEC = int(os.getenv("FG_HF_MEMORY_CACHE_TTL_SEC", "1800"))
+ENABLE_IMAGE_GROUNDING = os.getenv("FG_ENABLE_IMAGE_GROUNDING", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+IMAGE_GROUNDING_CACHE_TTL_SEC = int(os.getenv("FG_IMAGE_GROUNDING_CACHE_TTL_SEC", "1800"))
 HF_PERSONA_DATASET = os.getenv("FG_HF_PERSONA_DATASET", "SynthlabsAI/PERSONA")
 HF_PERSONA_DATASET_FALLBACKS = [
     value.strip()
@@ -151,6 +154,14 @@ FAST_FOOD_HINTS = [
 
 HEALTH_CLAIM_PATTERN = re.compile(
     r"\b(health(y|ier)?|nutriti(ous|on|onal)|wellness|good for (my|your|our) health|health benefits?)\b",
+    re.IGNORECASE,
+)
+UNSUPPORTED_PREMIUM_DISCOUNT_PATTERN = re.compile(
+    r"\b(designer collections?|personalized (service|experience)|white[- ]glove|concierge|vip service|luxury service)\b",
+    re.IGNORECASE,
+)
+NEGATION_PATTERN = re.compile(
+    r"\b(not|no|never|without|lacks?|doesn['’]?t|isn['’]?t|aren['’]?t|won['’]?t|cannot|can['’]?t)\b",
     re.IGNORECASE,
 )
 OBJECTIVE_UI_HINTS = [
@@ -300,22 +311,6 @@ SENTIMENT_UNCERTAIN_CUES = [
     "not sure",
     "mixed feelings",
 ]
-FALLBACK_REAL_WORLD_MEMORIES = [
-    "I bought a product once because the reviews sounded convincing, but it underdelivered in daily use.",
-    "I usually ignore flashy ads and look for practical details, especially return policy and long-term value.",
-    "A checkout flow confused me recently because key actions were hidden below too much content.",
-    "I changed my mind on a service after hearing mixed feedback from friends with different priorities.",
-    "I prefer clear, direct language over hype because I often compare options quickly between errands.",
-    "I once chose a cheaper option, then regretted it when reliability problems showed up within a month.",
-    "I trust products more when I can quickly understand what problem they solve for someone like me.",
-    "I am skeptical of broad claims unless I can find concrete examples or third-party validation.",
-    "I have clicked away from pages that felt cluttered or demanded too much effort to complete one task.",
-    "I am more likely to try something new if the first interaction feels simple and low-risk.",
-    "I value honest tradeoff explanations more than polished branding language.",
-    "I often read both highest and lowest reviews to find recurring patterns before deciding.",
-]
-
-
 class SimulateRequest(BaseModel):
     target_audience: str | None = Field(
         default=None,
@@ -386,10 +381,9 @@ class PersonaStore:
 app = FastAPI(title=APP_NAME, version="1.1.0")
 store = PersonaStore()
 _client: AsyncOpenAI | None = None
-_real_world_memory_cache: list[str] = []
-_real_world_memory_cache_at: float = 0.0
 _persona_seed_cache: list[dict[str, Any]] = []
 _persona_seed_cache_at: float = 0.0
+_image_grounding_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def ensure_openai_client() -> AsyncOpenAI:
@@ -904,6 +898,181 @@ def _rescore_subjective_sentiment(
     return _safe_float(combined, 0.0, -1.0, 1.0)
 
 
+def _normalize_short_text_list(
+    value: Any,
+    max_items: int = 8,
+    max_chars: int = 90,
+) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    if isinstance(value, list):
+        candidates = value
+    elif isinstance(value, str):
+        candidates = [segment.strip() for segment in re.split(r"[,\n;|]+", value) if segment.strip()]
+    else:
+        candidates = []
+
+    for candidate in candidates:
+        text = _normalize_memory_seed_text(candidate, max_chars=max_chars)
+        lowered = text.lower()
+        if text and lowered not in seen:
+            seen.add(lowered)
+            items.append(text)
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+async def _extract_image_grounding(image_url: str | None) -> dict[str, Any]:
+    if not image_url or not ENABLE_IMAGE_GROUNDING:
+        return {
+            "available": False,
+            "used": False,
+            "reason": "Image grounding disabled or no image URL provided.",
+            "brands": [],
+            "visible_text": [],
+            "pricing_signals": [],
+            "scene_type": "",
+        }
+
+    cached = _image_grounding_cache.get(image_url)
+    if cached and (time.time() - cached[0]) < IMAGE_GROUNDING_CACHE_TTL_SEC:
+        return dict(cached[1])
+
+    client = ensure_openai_client()
+    system_prompt = (
+        "Extract only factual visual evidence from the image. "
+        "Do not infer premium service, brand positioning, or sentiment unless explicitly visible."
+    )
+    user_prompt = (
+        "Return strict JSON with keys:\n"
+        "- brands: array of visible brand/store names\n"
+        "- visible_text: array of short OCR snippets exactly as seen\n"
+        "- pricing_signals: array of explicit price/sale cues\n"
+        "- scene_type: short label (storefront|in-store|ad-graphic|unknown)\n"
+        "- confidence: number 0-1\n"
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=OPENAI_VISION_MODEL,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                },
+            ],
+        )
+        content = response.choices[0].message.content or "{}"
+        parsed = _extract_json_object(content)
+
+        result = {
+            "available": True,
+            "used": True,
+            "reason": "Vision grounding extracted.",
+            "brands": _normalize_short_text_list(parsed.get("brands"), max_items=6, max_chars=60),
+            "visible_text": _normalize_short_text_list(parsed.get("visible_text"), max_items=10, max_chars=80),
+            "pricing_signals": _normalize_short_text_list(
+                parsed.get("pricing_signals"),
+                max_items=8,
+                max_chars=80,
+            ),
+            "scene_type": _safe_str(parsed.get("scene_type"), "unknown"),
+            "confidence": _safe_float(parsed.get("confidence"), 0.0, 0.0, 1.0),
+        }
+        _image_grounding_cache[image_url] = (time.time(), result)
+        return dict(result)
+    except Exception as error:
+        result = {
+            "available": False,
+            "used": False,
+            "reason": f"Vision grounding unavailable: {error}",
+            "brands": [],
+            "visible_text": [],
+            "pricing_signals": [],
+            "scene_type": "",
+        }
+        _image_grounding_cache[image_url] = (time.time(), result)
+        return result
+
+
+def _build_grounded_stimulus_description(
+    stimulus_description: str,
+    image_grounding: dict[str, Any],
+) -> str:
+    grounded = stimulus_description.strip()
+
+    brands = _normalize_short_text_list(image_grounding.get("brands"), max_items=4, max_chars=50)
+    visible_text = _normalize_short_text_list(
+        image_grounding.get("visible_text"),
+        max_items=6,
+        max_chars=70,
+    )
+    pricing_signals = _normalize_short_text_list(
+        image_grounding.get("pricing_signals"),
+        max_items=4,
+        max_chars=70,
+    )
+    scene_type = _safe_str(image_grounding.get("scene_type"), "")
+
+    additions: list[str] = []
+    if scene_type:
+        additions.append(f"scene={scene_type}")
+    if brands:
+        additions.append("brands=" + ", ".join(brands))
+    if visible_text:
+        additions.append("visible_text=" + " | ".join(visible_text))
+    if pricing_signals:
+        additions.append("pricing=" + " | ".join(pricing_signals))
+
+    if not additions:
+        return grounded
+
+    return grounded + "\n\nVerified image evidence:\n- " + "\n- ".join(additions)
+
+
+def _build_persona_seed_memory_pool(seed_pool: list[dict[str, Any]]) -> list[str]:
+    memory_pool: list[str] = []
+    seen: set[str] = set()
+
+    for seed in seed_pool:
+        for memory in _normalize_string_list(seed.get("memory_stream"), []):
+            cleaned = _normalize_memory_seed_text(memory, max_chars=220)
+            lowered = cleaned.lower()
+            if cleaned and lowered not in seen:
+                seen.add(lowered)
+                memory_pool.append(cleaned)
+
+        occupation = _safe_str(seed.get("occupation"), "")
+        region = _safe_str(seed.get("region"), "")
+        daily_context = _safe_str(seed.get("daily_context"), "")
+        if occupation or region or daily_context:
+            fallback = " ".join(
+                part
+                for part in [
+                    f"I work as {occupation}." if occupation else "",
+                    f"I live in {region}." if region else "",
+                    daily_context,
+                ]
+                if part
+            ).strip()
+            cleaned_fallback = _normalize_memory_seed_text(fallback, max_chars=220)
+            lowered_fallback = cleaned_fallback.lower()
+            if cleaned_fallback and lowered_fallback not in seen:
+                seen.add(lowered_fallback)
+                memory_pool.append(cleaned_fallback)
+
+    random.shuffle(memory_pool)
+    return memory_pool
+
+
 async def _classify_task_type(stimulus_description: str) -> dict[str, str]:
     heuristic = _heuristic_task_type(stimulus_description)
     client = ensure_openai_client()
@@ -1089,80 +1258,6 @@ def _normalize_hf_persona_seed_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in seed.items() if value}
 
 
-def _extract_memory_text_from_row(row: dict[str, Any]) -> str:
-    candidates: list[str] = []
-
-    for key in [
-        "question_title",
-        "question_content",
-        "best_answer",
-        "summary",
-        "text",
-        "content",
-        "review_text",
-        "body",
-        "title",
-        "question",
-        "answer",
-        "bio",
-        "background",
-        "description",
-        "profile",
-        "persona",
-        "opinion",
-        "experience",
-    ]:
-        cleaned = _normalize_memory_seed_text(row.get(key))
-        if cleaned:
-            candidates.append(cleaned)
-
-    if not candidates:
-        return ""
-
-    combined = " | ".join(candidates[:3])
-    return _normalize_memory_seed_text(combined, max_chars=420)
-
-
-def _load_hf_memory_pool_sync(sample_size: int) -> list[str]:
-    if load_dataset is None:
-        return []
-
-    min_pool = max(1, HF_MEMORY_POOL_MIN)
-    max_pool = max(min_pool, HF_MEMORY_POOL_MAX)
-    requested = max(min_pool, min(max_pool, sample_size))
-
-    try:
-        start_pct = random.randint(0, 97)
-        end_pct = min(100, start_pct + 2)
-        split = f"train[{start_pct}%:{end_pct}%]"
-        dataset = load_dataset(HF_MEMORY_DATASET, split=split)
-    except Exception:
-        return []
-
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    try:
-        for row in dataset:
-            if not isinstance(row, dict):
-                continue
-            text = _extract_memory_text_from_row(row)
-            if not text:
-                continue
-            lowered = text.lower()
-            if lowered in seen:
-                continue
-            seen.add(lowered)
-            candidates.append(text)
-            if len(candidates) >= requested * 5:
-                break
-    except Exception:
-        return []
-
-    random.shuffle(candidates)
-    return candidates[:requested]
-
-
 def _sample_from_pool(pool: list[str], sample_count: int) -> list[str]:
     clean_pool = [_normalize_memory_seed_text(item) for item in pool if _normalize_memory_seed_text(item)]
     if not clean_pool:
@@ -1170,33 +1265,6 @@ def _sample_from_pool(pool: list[str], sample_count: int) -> list[str]:
     if len(clean_pool) >= sample_count:
         return random.sample(clean_pool, sample_count)
     return [random.choice(clean_pool) for _ in range(sample_count)]
-
-
-async def _get_real_world_memory_pool() -> list[str]:
-    global _real_world_memory_cache
-    global _real_world_memory_cache_at
-
-    now = time.time()
-    if (
-        _real_world_memory_cache
-        and (now - _real_world_memory_cache_at) < HF_MEMORY_CACHE_TTL_SEC
-    ):
-        return _real_world_memory_cache.copy()
-
-    target_size = random.randint(
-        max(1, HF_MEMORY_POOL_MIN),
-        max(max(1, HF_MEMORY_POOL_MIN), HF_MEMORY_POOL_MAX),
-    )
-    loaded = await asyncio.to_thread(_load_hf_memory_pool_sync, target_size)
-
-    if loaded:
-        _real_world_memory_cache = loaded
-        _real_world_memory_cache_at = now
-        return loaded.copy()
-
-    _real_world_memory_cache = FALLBACK_REAL_WORLD_MEMORIES.copy()
-    _real_world_memory_cache_at = now
-    return _real_world_memory_cache.copy()
 
 
 def _normalize_tech_comfort(raw: str) -> str:
@@ -1638,8 +1706,10 @@ def _resolve_dimension_score(
 def _stimulus_flags(stimulus_description: str) -> dict[str, bool]:
     normalized = stimulus_description.lower()
     is_fast_food = any(hint in normalized for hint in FAST_FOOD_HINTS)
+    is_discount_retail = any(hint in normalized for hint in DISCOUNT_STIMULUS_HINTS)
     return {
         "is_fast_food": is_fast_food,
+        "is_discount_retail": is_discount_retail,
     }
 
 
@@ -1651,12 +1721,22 @@ def _sanitize_claim_text(text: str, flags: dict[str, bool]) -> str:
     if flags.get("is_fast_food") and HEALTH_CLAIM_PATTERN.search(cleaned):
         return "I like the taste and convenience, but I do not see this as a health-focused option."
 
+    if (
+        flags.get("is_discount_retail")
+        and UNSUPPORTED_PREMIUM_DISCOUNT_PATTERN.search(cleaned)
+        and not NEGATION_PATTERN.search(cleaned)
+    ):
+        return (
+            "I see this as a value-first, off-price retail environment, "
+            "not a luxury designer or personalized concierge experience."
+        )
+
     return cleaned
 
 
 def _sanitize_persona_claims(persona: dict[str, Any], stimulus_description: str) -> dict[str, Any]:
     flags = _stimulus_flags(stimulus_description)
-    if not flags.get("is_fast_food"):
+    if not flags.get("is_fast_food") and not flags.get("is_discount_retail"):
         return persona
 
     sanitized = dict(persona)
@@ -1852,6 +1932,7 @@ Rules:
 - Do NOT force any sentiment distribution. Let sentiment emerge organically from persona context.
 - If market fit is mismatch, include more skepticism and concrete status/value tradeoff concerns.
 - Avoid defaulting to polite neutral responses for subjective concept prompts.
+- If stimulus evidence indicates off-price/discount retail, do not claim luxury concierge service or designer curation unless explicitly visible in the evidence.
 """
 
     raw_panel: list[dict[str, Any]] = []
@@ -1900,20 +1981,31 @@ Rules:
 
         normalized.append(entry)
 
-    memory_pool = await _get_real_world_memory_pool()
+    persona_memory_pool = _build_persona_seed_memory_pool(persona_seed_pool)
     min_mem = max(1, HF_MEMORY_PER_PERSONA_MIN)
     max_mem = max(min_mem, HF_MEMORY_PER_PERSONA_MAX)
 
     for entry in normalized:
         per_persona_count = random.randint(min_mem, max_mem)
-        assigned = _sample_from_pool(memory_pool, per_persona_count)
-        if assigned:
-            entry["memory_stream"] = assigned
-        elif not entry.get("memory_stream"):
-            entry["memory_stream"] = _sample_from_pool(
-                FALLBACK_REAL_WORLD_MEMORIES,
-                per_persona_count,
-            )
+        existing = _normalize_string_list(entry.get("memory_stream"), [])
+        assigned = _sample_from_pool(persona_memory_pool, per_persona_count)
+        combined = [*existing]
+        for memory in assigned:
+            if memory not in combined:
+                combined.append(memory)
+
+        if not combined:
+            fallback_context = " ".join(
+                [
+                    f"I work as {_safe_str(entry.get('occupation'), 'a professional')}.",
+                    f"My routine: {_safe_str(entry.get('daily_context'), 'busy daily decisions')}.",
+                    f"I usually optimize for {_safe_str(entry.get('budget_sensitivity'), 'balanced')} spending.",
+                ]
+            ).strip()
+            fallback_memory = _normalize_memory_seed_text(fallback_context, max_chars=220)
+            combined = [fallback_memory] if fallback_memory else []
+
+        entry["memory_stream"] = combined[: max(per_persona_count, 3)]
 
     return _apply_market_fit_guidance_to_blueprints(normalized, market_fit_context)
 
@@ -2146,7 +2238,20 @@ def _normalize_persona(
         normalized["sentiment_label"] = _sentiment_label_from_score(rescored)
         normalized["sentiment_intensity"] = _sentiment_intensity_from_score(rescored)
 
-    return _sanitize_persona_claims(normalized, stimulus_description)
+    sanitized = _sanitize_persona_claims(normalized, stimulus_description)
+    if task_type != "Objective UI Task":
+        rescored_sanitized = _rescore_subjective_sentiment(
+            base_score=_safe_float(sanitized.get("sentiment_score"), sentiment_score),
+            profile=sanitized,
+            stance=stance,
+            market_fit_context=market_fit_context,
+            index=index,
+        )
+        sanitized["sentiment_score"] = rescored_sanitized
+        sanitized["sentiment_label"] = _sentiment_label_from_score(rescored_sanitized)
+        sanitized["sentiment_intensity"] = _sentiment_intensity_from_score(rescored_sanitized)
+
+    return sanitized
 
 
 def _persona_seed_prompt(
@@ -2263,6 +2368,7 @@ Rules:
 - Do not invent objective claims (health/safety/legal/scientific) unless clearly supported by the stimulus.
 - If the stimulus is fast food or indulgent food, do not call it healthy.
 - If market fit is mismatch, skepticism is expected unless you provide specific counterevidence.
+- If stimulus evidence is off-price/discount retail (e.g., Ross-style sale signage), avoid claiming luxury personalized service or designer curation unless explicitly shown.
 - {task_type_guidance}
 """
     return system_prompt, user_prompt
@@ -2534,6 +2640,7 @@ You are role-playing this persona in first person:
 
 Answer naturally as this persona would.
 Do not invent objective claims (health/safety/legal/scientific) without support in memory snippets.
+If context indicates off-price/discount retail, do not claim luxury concierge or designer curation unless memory snippets support it.
 Return valid JSON only with keys:
 - answer (string)
 - confidence (number 0-1)
@@ -2562,24 +2669,33 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "service": APP_NAME,
         "model": OPENAI_MODEL,
+        "vision_model": OPENAI_VISION_MODEL,
         "model_fallbacks": OPENAI_MODEL_FALLBACKS,
         "embedding_model": OPENAI_EMBEDDING_MODEL,
         "persona_dataset": HF_PERSONA_DATASET,
+        "memory_source": "persona_dataset_only",
+        "image_grounding_enabled": ENABLE_IMAGE_GROUNDING,
         "persona_store_size": await store.size(),
     }
 
 
 @app.post("/synthetic/simulate")
 async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
+    image_grounding = await _extract_image_grounding(request.image_url)
+    grounded_stimulus_description = _build_grounded_stimulus_description(
+        request.stimulus_description,
+        image_grounding,
+    )
+
     audience_info = await _resolve_target_audience(
         requested_target=request.target_audience,
-        stimulus_description=request.stimulus_description,
+        stimulus_description=grounded_stimulus_description,
     )
-    task_type_info = await _classify_task_type(request.stimulus_description)
+    task_type_info = await _classify_task_type(grounded_stimulus_description)
     task_type = _safe_str(task_type_info.get("task_type"), "Subjective Concept")
     market_fit_context = _build_market_fit_context(
         target_audience=audience_info["target_audience"],
-        stimulus_description=request.stimulus_description,
+        stimulus_description=grounded_stimulus_description,
         task_type=task_type,
     )
 
@@ -2587,12 +2703,12 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
     analysis_dimensions = await _resolve_analysis_dimensions(
         requested_dimensions=None,
         target_audience=resolved_target_audience,
-        stimulus_description=request.stimulus_description,
+        stimulus_description=grounded_stimulus_description,
     )
 
     blueprints = await _build_diversity_blueprints(
         target_audience=resolved_target_audience,
-        stimulus_description=request.stimulus_description,
+        stimulus_description=grounded_stimulus_description,
         task_type=task_type,
         persona_count=request.persona_count,
         market_fit_context=market_fit_context,
@@ -2602,7 +2718,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
     tasks = [
         _generate_one_persona(
             target_audience=resolved_target_audience,
-            stimulus_description=request.stimulus_description,
+            stimulus_description=grounded_stimulus_description,
             image_url=request.image_url,
             task_type=task_type,
             market_fit_context=market_fit_context,
@@ -2636,7 +2752,7 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
                 agent_id=fallback_agent_id,
                 profile={
                     "agent_id": fallback_agent_id,
-                    "stimulus_description": request.stimulus_description,
+                    "stimulus_description": grounded_stimulus_description,
                     "task_type": task_type,
                     **fallback_profile,
                     "generation_error": str(result),
@@ -2676,6 +2792,9 @@ async def simulate_focus_group(request: SimulateRequest) -> dict[str, Any]:
         "task_type": task_type,
         "task_type_rationale": _safe_str(task_type_info.get("task_type_rationale"), ""),
         "market_fit_context": market_fit_context,
+        "memory_source": "synthlabs_persona_dataset",
+        "grounded_stimulus_used": grounded_stimulus_description != request.stimulus_description,
+        "image_grounding": image_grounding,
         "analysis_dimensions": analysis_dimensions,
         "manager_summary": manager_summary,
         "personas": persona_payloads,
